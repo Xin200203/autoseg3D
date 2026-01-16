@@ -816,6 +816,40 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             cluster_both = cluster_complete_link(iou_map * m * labels_mask.float(), 0.5)
             valid_sps_list.append(cluster_both)
 
+        # Optional: monitoring for LMI/SCL superpoint merging (fragment merge).
+        # This is a pure side-channel: it must not affect merging behavior.
+        monitor_cfg = {}
+        try:
+            monitor_cfg = (self.test_cfg.get('online_monitor', None) or {}) if hasattr(self, 'test_cfg') else {}
+        except Exception:
+            monitor_cfg = {}
+        monitor_enable = bool(monitor_cfg.get('enable', False))
+        sp_merge_stats = None
+        if monitor_enable:
+            try:
+                # batch size is usually 1 at test time; keep per-batch stats list for robustness.
+                per_batch = []
+                for batch_idx in range(len(current_sp_pts_mask)):
+                    sp_pts_mask0 = current_sp_pts_mask[batch_idx]
+                    sp_before = int(sp_pts_mask0.max().item() + 1) if sp_pts_mask0.numel() else 0
+                    gt_inst = None
+                    try:
+                        gt_inst = batch_data_samples[batch_idx].gt_pts_seg.pts_instance_mask[frame_i]
+                    except Exception:
+                        gt_inst = None
+                    per_batch.append({
+                        "sp_before": sp_before,
+                        "gt_inst_available": bool(gt_inst is not None),
+                    })
+                sp_merge_stats = {
+                    "frame": int(frame_i),
+                    "merge_algo": "cluster_complete_link(iou_map*m*labels_mask, thr=0.5)",
+                    "use_bbox": bool(getattr(self, 'use_bbox', False)),
+                    "batch": per_batch,
+                }
+            except Exception:
+                sp_merge_stats = {"frame": int(frame_i), "error": "sp_merge_stats_init_failed"}
+
         # generate merged masks and update in-place
         for batch_idx in range(len(current_sp_pts_mask)):
             sp_pts_mask = current_sp_pts_mask[batch_idx]
@@ -845,6 +879,73 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 final_mask[merged_mask == old_id] = nid
             batch_data_samples[batch_idx].gt_pts_seg.sp_pts_mask[frame_i] = final_mask
 
+            if monitor_enable and sp_merge_stats is not None:
+                try:
+                    sp_after = int(final_mask.max().item() + 1) if final_mask.numel() else 0
+                    group_sizes = [int(len(g)) for g in merged_groups if isinstance(g, (list, tuple))]
+
+                    # Pairwise "precision" of merges using per-frame GT instance ids (positive if same GT).
+                    # This evaluates: among merged SP pairs, how many belong to the same GT instance.
+                    # We do NOT attempt recall here (requires enumerating all positive pairs).
+                    pair_total = pair_pos = pair_neg = pair_bg = 0
+                    try:
+                        gt_inst = batch_data_samples[batch_idx].gt_pts_seg.pts_instance_mask[frame_i]
+                    except Exception:
+                        gt_inst = None
+                    if gt_inst is not None and gt_inst.numel() == sp_pts_mask.numel():
+                        def _dominant_gt_id(sp_id: int) -> int:
+                            pts = gt_inst[sp_pts_mask == sp_id]
+                            pts = pts[pts >= 0]
+                            if pts.numel() == 0:
+                                return -1
+                            vals, cnts = pts.unique(return_counts=True)
+                            return int(vals[cnts.argmax()].item())
+
+                        # Cache dominant ids to avoid repeated scans.
+                        dom_cache = {}
+                        for g in merged_groups:
+                            if not isinstance(g, (list, tuple)) or len(g) < 2:
+                                continue
+                            dom_ids = []
+                            for sp_id in g:
+                                sp_id_int = int(sp_id)
+                                if sp_id_int not in dom_cache:
+                                    dom_cache[sp_id_int] = _dominant_gt_id(sp_id_int)
+                                dom_ids.append(dom_cache[sp_id_int])
+                            # Count pairs inside this group
+                            n = len(dom_ids)
+                            for i in range(n):
+                                for j in range(i + 1, n):
+                                    a, b = dom_ids[i], dom_ids[j]
+                                    pair_total += 1
+                                    if a < 0 or b < 0:
+                                        pair_bg += 1
+                                    elif a == b:
+                                        pair_pos += 1
+                                    else:
+                                        pair_neg += 1
+
+                    sp_merge_stats["batch"][batch_idx].update({
+                        "sp_after": sp_after,
+                        "merge_drop": int(sp_merge_stats["batch"][batch_idx].get("sp_before", 0) - sp_after),
+                        "num_groups": int(len(merged_groups)),
+                        "group_size": {
+                            "n": int(len(group_sizes)),
+                            "mean": float(sum(group_sizes) / max(len(group_sizes), 1)),
+                            "max": int(max(group_sizes) if group_sizes else 0),
+                        },
+                        "pair": {
+                            "total": int(pair_total),
+                            "pos": int(pair_pos),
+                            "neg": int(pair_neg),
+                            "bg": int(pair_bg),
+                            "pos_rate": float(pair_pos / max(pair_total, 1)),
+                            "neg_rate": float(pair_neg / max(pair_total, 1)),
+                        },
+                    })
+                except Exception:
+                    sp_merge_stats["batch"][batch_idx].update({"error": "sp_merge_stats_failed"})
+
         # 5) pool with merged superpixels to produce final features
         sp_pts_masks_new, n_super_points_new = [], []
         for data_sample in batch_data_samples:
@@ -859,6 +960,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             end = sum(n_super_points_new[:i + 1])
             features_final.append(x_pooled_new[begin: end, :-3])
             sp_xyz_list.append(x_pooled_new[begin: end, -3:])
+        if monitor_enable:
+            # Store last frame stats for the outer predict() loop to consume.
+            # Keep it minimal and JSON-friendly.
+            try:
+                self._last_sp_merge_stats = sp_merge_stats
+            except Exception:
+                pass
         return features_final, point_features, all_xyz_w, sp_xyz_list
     
     def _select_queries(self, x, gt_instances, sp_xyz, frame_i):
@@ -1630,6 +1738,50 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             self.inst_dict = None
         if self.use_mot:
             self.current_max_track_id = 0
+        # Optional: per-scene monitoring (side-channel; does not affect outputs).
+        online_monitor_cfg = self.test_cfg.get('online_monitor', None) or {}
+        online_monitor_enable = bool(online_monitor_cfg.get('enable', False))
+        online_monitor = None
+        if online_monitor_enable:
+            meta = getattr(batch_data_samples[0], 'img_metas', None)
+            if not isinstance(meta, dict):
+                try:
+                    meta = batch_data_samples[0].metainfo
+                except Exception:
+                    meta = {}
+            scene_id = (
+                meta.get('scene_id', None)
+                or meta.get('scan_id', None)
+                or meta.get('sample_idx', None)
+                or meta.get('lidar_idx', None)
+                or meta.get('ann_file', None)
+                or meta.get('pts_filename', None)
+                or 'unknown'
+            )
+            online_monitor = {
+                "scene_id": str(scene_id),
+                "num_frames": int(num_frames),
+                "test_cfg": {
+                    "merge_sp_masks": bool(getattr(self, 'merge_sp_masks', False)),
+                    "use_bbox": bool(getattr(self, 'use_bbox', False)),
+                    "merge_type": str(self.test_cfg.get('merge_type', '')),
+                    "topk_insts": int(self.test_cfg.get('topk_insts', -1)),
+                    "inst_score_thr": float(self.test_cfg.get('inst_score_thr', 0.0)),
+                    "pan_score_thr": float(self.test_cfg.get('pan_score_thr', 0.0)),
+                    "sp_score_thr": float(self.test_cfg.get('sp_score_thr', 0.0)),
+                    "npoint_thr": int(self.test_cfg.get('npoint_thr', 0)),
+                    "obj_normalization": bool(self.test_cfg.get('obj_normalization', False)),
+                    "inscat_topk_insts": int(self.test_cfg.get('inscat_topk_insts', -1)),
+                    "nms": bool(self.test_cfg.get('nms', False)),
+                    "matrix_nms_kernel": str(self.test_cfg.get('matrix_nms_kernel', '')),
+                },
+                "monitor_cfg": {
+                    k: v
+                    for k, v in (dict(online_monitor_cfg).items() if isinstance(online_monitor_cfg, dict) else [])
+                    if isinstance(v, (bool, int, float, str))
+                },
+                "frames": [],
+            }
         for frame_i in range(num_frames):
             ## Backbone + SP merge (optional)  -> features, point_features, all_xyz_w, sp_xyz
             if self.merge_sp_masks:
@@ -1662,6 +1814,21 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w) # ([20000], [20000, 1])
             x = self.decoder(x, point_features, x, super_points) # [N_segment, 96] [20000, 99] [N_segment, 96] ([20000], [20000, 1])
             ## Post-processing
+            if online_monitor_enable:
+                # Provide per-frame GT instance ids to post-processing for optional GT-aware stats.
+                # This is strictly for monitoring and must not affect prediction results.
+                try:
+                    gt_inst = batch_data_samples[0].gt_pts_seg.pts_instance_mask[frame_i]
+                except Exception:
+                    gt_inst = None
+                self._monitor_frame_ctx = {
+                    "frame": int(frame_i),
+                    "gt_inst": gt_inst,
+                    "gt_vis_npoint": int(online_monitor_cfg.get("gt_vis_npoint", 100)),
+                    "iou_thr": float(online_monitor_cfg.get("iou_thr", 0.5)),
+                    "iou_lo_thr": float(online_monitor_cfg.get("iou_lo_thr", 0.1)),
+                    "gt_frame_stride": int(online_monitor_cfg.get("gt_frame_stride", 5)),
+                }
             pred_pts_seg, mapping = self.predict_by_feat(
                 x, batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i])
             results.append(pred_pts_seg[0])
@@ -1812,13 +1979,18 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
                 if frame_i == 0:
                     if self.use_mot and self.mot_type == 'dq_track':
+                        diag_cfg = {}
+                        if online_monitor_enable and isinstance(online_monitor_cfg, dict):
+                            diag_cfg = online_monitor_cfg.get("bbox_center_diag", {}) or {}
                         online_merger = DQ_Track_OnlineMerge(
                             self.test_cfg.inscat_topk_insts,
                             self.use_bbox,
                             self.asso_config.get('update_type', 'count'),
-                            self.asso_config.get('use_buffer', False))
+                            self.asso_config.get('use_buffer', False),
+                            diag_cfg=diag_cfg)
                     else:
                         online_merger = OnlineMerge(self.test_cfg.inscat_topk_insts, self.use_bbox)
+                online_merger_ref = online_merger
                 if self.use_mot and self.mot_type == 'dq_track':
                     mv_mask, mv_labels, mv_scores, self.current_max_track_id= online_merger.merge( # , mv_queries
                         results[-1].pop('pts_instance_mask')[0],
@@ -1829,7 +2001,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
                         bboxes_list.pop(-1)[0] if self.use_bbox else None,
-                        det2track_mat, det2buffer_mat, track_instances, track_embedding_for_update, self.current_max_track_id, det_category)
+                        det2track_mat, det2buffer_mat, track_instances, track_embedding_for_update, self.current_max_track_id, det_category,
+                        gt_inst=(self._monitor_frame_ctx.get("gt_inst", None) if isinstance(getattr(self, "_monitor_frame_ctx", None), dict) else None),
+                        frame_idx=int(frame_i),
+                        frame_points_xyz=(batch_inputs_dict['points'][0][frame_i, :, :3] if isinstance(batch_inputs_dict.get('points', None), (list, tuple)) else None))
                 else:
                     mv_mask, mv_labels, mv_scores, mv_bboxes = online_merger.merge( # , mv_queries
                         results[-1].pop('pts_instance_mask')[0],
@@ -1845,8 +2020,18 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     # track_instances = self.update_track_instances_predict(track_instances, mapping, indices, is_last)
                 # Empty cache. Only offline merging requires the whole list.
                 torch.cuda.empty_cache()
-                if frame_i == num_frames - 1:
-                    online_merger.clean() # Ignore panoptic segmentation
+                if online_monitor_enable and online_monitor is not None:
+                    fr = {"frame": int(frame_i)}
+                    # Fragment merge stats (LMI/SCL) from merge_superpixels_extract_feat
+                    if isinstance(getattr(self, "_last_sp_merge_stats", None), dict):
+                        fr["sp_merge"] = self._last_sp_merge_stats
+                    # Det filter stats from predict_by_feat_instance
+                    if isinstance(getattr(self, "_last_det_filter_stats", None), dict):
+                        fr["det_filter"] = self._last_det_filter_stats
+                    # Online association stats from merger
+                    if isinstance(getattr(online_merger, "last_stats", None), dict):
+                        fr["assoc"] = online_merger.last_stats
+                    online_monitor["frames"].append(fr)
         
         ## Offline merging
         if self.test_cfg.merge_type == 'learnable':
@@ -1936,6 +2121,24 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             merged_result = self.segment_smooth(merged_result, mv_xyz.device,
                 batch_data_samples[0].eval_ann_info['segment_ids'])
         batch_data_samples[0].pred_pts_seg = merged_result
+        if online_monitor_enable and online_monitor is not None:
+            merged_result.online_monitor = online_monitor
+        # Optional: export bbox/center diagnostics as a separate payload (not part of online_monitor JSON).
+        try:
+            if online_monitor_enable and isinstance(online_monitor_cfg, dict):
+                diag_cfg = online_monitor_cfg.get("bbox_center_diag", {}) or {}
+                if bool(diag_cfg.get("enable", False)) and isinstance(locals().get("online_merger_ref", None), DQ_Track_OnlineMerge):
+                    merged_result.bbox_center_diag = online_merger_ref.export_bbox_center_diag()
+        except Exception:
+            pass
+        # Clean online merger state after exporting optional diagnostics.
+        try:
+            if self.test_cfg.merge_type == 'learnable_online':
+                om = locals().get("online_merger_ref", None)
+                if om is not None and hasattr(om, "clean"):
+                    om.clean()
+        except Exception:
+            pass
 
         return batch_data_samples
     def merge_superpixels(self, current_sp_pts_mask, current_pt_instance_mask, overlap_threshold=0.8):
@@ -2474,20 +2677,47 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             # )
         return loss
     def segment_smooth(self, results, device, segment_ids):
-        unique_ids = np.unique(segment_ids)
-        new_segment_ids = np.zeros_like(segment_ids)
-        for i, ids in enumerate(unique_ids):
-            new_segment_ids[segment_ids == ids] = i
-        segment_ids = new_segment_ids
-        segment_ids = torch.from_numpy(segment_ids).to(device)
-        sem_mask = torch.from_numpy(results.pts_semantic_mask[0]).to(device)
-        ins_mask = torch.from_numpy(results.pts_instance_mask[0]).to(device)
-        sem_mask = scatter_mean(F.one_hot(sem_mask).float(), segment_ids, dim=0)
-        sem_mask = sem_mask.argmax(dim=1)[segment_ids]
-        ins_mask = scatter_mean(ins_mask.float(), segment_ids, dim=1)
-        ins_mask = (ins_mask > 0.5)[:, segment_ids]
-        results.pts_semantic_mask[0] = sem_mask.cpu().numpy()
-        results.pts_instance_mask[0] = ins_mask.cpu().numpy()
+        # Robust to empty instance predictions: torch_scatter.scatter_mean
+        # will crash when src has a zero-size dimension.
+        if segment_ids is None:
+            return results
+
+        segment_ids = np.asarray(segment_ids)
+        if segment_ids.size == 0:
+            return results
+
+        sem_np = results.pts_semantic_mask[0]
+        ins_np = results.pts_instance_mask[0]
+        if sem_np is None or ins_np is None:
+            return results
+
+        sem_np = np.asarray(sem_np)
+        ins_np = np.asarray(ins_np)
+
+        num_points = int(sem_np.shape[0])
+        if segment_ids.shape[0] != num_points:
+            # Segment ids should align with reconstructed point count.
+            return results
+        if ins_np.ndim != 2 or ins_np.shape[1] != num_points:
+            return results
+
+        _, inverse = np.unique(segment_ids, return_inverse=True)
+        seg_t = torch.as_tensor(inverse, device=device, dtype=torch.long)
+
+        sem_t = torch.as_tensor(sem_np, device=device, dtype=torch.long)
+        sem_seg = scatter_mean(F.one_hot(sem_t).float(), seg_t, dim=0)
+        sem_out = sem_seg.argmax(dim=1)[seg_t]
+
+        if ins_np.shape[0] == 0:
+            results.pts_semantic_mask[0] = sem_out.cpu().numpy()
+            return results
+
+        ins_t = torch.as_tensor(ins_np, device=device).float()
+        ins_seg = scatter_mean(ins_t, seg_t, dim=1)
+        ins_out = (ins_seg > 0.5)[:, seg_t]
+
+        results.pts_semantic_mask[0] = sem_out.cpu().numpy()
+        results.pts_instance_mask[0] = ins_out.cpu().numpy()
         return results
     
     def predict_by_feat(self, out, superpoints):
@@ -2586,6 +2816,33 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
 
+        # Optional monitoring: record per-stage counts and GT-aware duplication stats.
+        monitor_cfg = {}
+        try:
+            monitor_cfg = self.test_cfg.get('online_monitor', None) or {}
+        except Exception:
+            monitor_cfg = {}
+        monitor_enable = bool(monitor_cfg.get('enable', False))
+        det_stats = None
+        if monitor_enable:
+            det_stats = {
+                "after_topk": int(topk_num),
+                "after_nms": int(mask_pred.shape[0]),
+                "sp_score_thr": float(self.test_cfg.get('sp_score_thr', 0.0)),
+                "inst_score_thr": float(score_threshold),
+                "npoint_thr": int(self.test_cfg.get('npoint_thr', 0)),
+            }
+            # GT-aware stats are computed sparsely to control runtime.
+            ctx = getattr(self, "_monitor_frame_ctx", None)
+            if isinstance(ctx, dict):
+                gt_inst = ctx.get("gt_inst", None)
+                stride = int(ctx.get("gt_frame_stride", 5))
+                fr = int(ctx.get("frame", -1))
+                do_gt = (gt_inst is not None) and (stride > 0) and (fr >= 0) and (fr % stride == 0)
+                det_stats["gt_eval"] = bool(do_gt)
+            else:
+                det_stats["gt_eval"] = False
+
         # score_thr
         score_mask = scores > score_threshold # [n_preds] 
         scores = scores[score_mask]
@@ -2602,6 +2859,87 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred = mask_pred[npoint_mask]
         queries = queries[npoint_mask]
         mapping = mapping[npoint_mask]
+
+        if monitor_enable and det_stats is not None:
+            det_stats["after_inst_thr"] = int(score_mask.sum().item())
+            det_stats["after_npoint_thr"] = int(mask_pred.shape[0])
+            # GT-aware duplication stats (hit0/hit_ge2) for pre-pool vs det_to_merge.
+            ctx = getattr(self, "_monitor_frame_ctx", None)
+            if isinstance(ctx, dict):
+                gt_inst = ctx.get("gt_inst", None)
+                stride = int(ctx.get("gt_frame_stride", 5))
+                fr = int(ctx.get("frame", -1))
+                do_gt = (gt_inst is not None) and (stride > 0) and (fr >= 0) and (fr % stride == 0)
+                if do_gt:
+                    try:
+                        gt_vis_npoint = int(ctx.get("gt_vis_npoint", 100))
+                        iou_thr = float(ctx.get("iou_thr", 0.5))
+                        iou_lo = float(ctx.get("iou_lo_thr", 0.1))
+
+                        # Reconstruct pre-pool masks after NMS+sp_thr but before inst/npoint filtering.
+                        # Note: the tensors were already filtered by NMS; we stored them in `mask_pred_pre`.
+                        # Here we recompute masks for pre-pool using the same intermediate variables.
+                        # `mask_pred_pre` corresponds to `mask_pred` before score_mask was applied.
+                        # We cannot reuse the overwritten `mask_pred`, so rebuild from cached `keep_inds` output.
+                        # Simplest: treat `mask_pred_pre` as the binary masks right after sp_thr and before score_thr.
+                        # It is still available as `mask_pred_sigmoid > sp_thr` with current keep_inds.
+                        mask_pred_pre = (mask_pred_sigmoid > self.test_cfg.sp_score_thr)
+
+                        def _build_gt_masks(gt_ids, vis_thr):
+                            gt_ids = gt_ids.detach()
+                            gt_ids = gt_ids.to(mask_pred_pre.device)
+                            uniq = torch.unique(gt_ids)
+                            uniq = uniq[uniq >= 0]
+                            if uniq.numel() == 0:
+                                return None
+                            masks = []
+                            for gid in uniq.tolist():
+                                m = (gt_ids == int(gid))
+                                if int(m.sum().item()) >= vis_thr:
+                                    masks.append(m)
+                            if not masks:
+                                return None
+                            return torch.stack(masks, dim=0)  # [G, P]
+
+                        gt_masks = _build_gt_masks(gt_inst, gt_vis_npoint)
+                        if gt_masks is None:
+                            det_stats["gt_vis"] = 0
+                        else:
+                            det_stats["gt_vis"] = int(gt_masks.shape[0])
+
+                            def _hit_stats(pred_masks, gt_masks, thr):
+                                if pred_masks.numel() == 0 or gt_masks.numel() == 0:
+                                    return {"hit0": 0.0, "hit_ge2": 0.0, "mean_mult": 0.0}
+                                pm = pred_masks.float()
+                                gm = gt_masks.float()
+                                inter = pm @ gm.t()  # [P, G]
+                                ps = pm.sum(1, keepdim=True)
+                                gs = gm.sum(1, keepdim=True).t()
+                                union = ps + gs - inter
+                                iou = inter / (union + 1e-6)
+                                hit = (iou >= thr).sum(0)  # [G]
+                                hit0 = float((hit == 0).float().mean().item())
+                                hit_ge2 = float((hit >= 2).float().mean().item())
+                                pos = hit[hit >= 1].float()
+                                mean_mult = float((pos.mean().item()) if pos.numel() else 0.0)
+                                return {"hit0": hit0, "hit_ge2": hit_ge2, "mean_mult": mean_mult}
+
+                            det_stats["pre_pool"] = {
+                                "n_pred": int(mask_pred_pre.shape[0]),
+                                "iou05": _hit_stats(mask_pred_pre, gt_masks, iou_thr),
+                                "iou01": _hit_stats(mask_pred_pre, gt_masks, iou_lo),
+                            }
+                            det_stats["det_to_merge"] = {
+                                "n_pred": int(mask_pred.shape[0]),
+                                "iou05": _hit_stats(mask_pred, gt_masks, iou_thr),
+                                "iou01": _hit_stats(mask_pred, gt_masks, iou_lo),
+                            }
+                    except Exception:
+                        det_stats["gt_error"] = "gt_dup_stats_failed"
+            try:
+                self._last_det_filter_stats = det_stats
+            except Exception:
+                pass
 
         return mask_pred, labels, scores, queries, mapping
     

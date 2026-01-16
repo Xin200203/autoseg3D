@@ -6,6 +6,7 @@ from mmdet3d.structures import AxisAlignedBboxOverlaps3D
 import pdb
 from sklearn.cluster import AgglomerativeClustering
 import networkx as nx
+import math
 
 # This function is deprecated by OnlineMerge. No update anymore.
 def ins_merge_mat(masks, labels, scores, queries, query_feats, sem_preds, xyz_list, inscat_topk_insts):
@@ -324,10 +325,11 @@ class OnlineMerge():
 
 
 class DQ_Track_OnlineMerge():
-    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", use_buffer=False):
+    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", use_buffer=False, diag_cfg=None):
         self.merge_type = merge_type
         self.inscat_topk_insts = inscat_topk_insts
         self.use_bbox = use_bbox
+        self.use_buffer = bool(use_buffer)
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         self.cur_masks = None
@@ -338,21 +340,172 @@ class DQ_Track_OnlineMerge():
         self.cur_sem_preds = None
         self.cur_xyz = None
         self.fi = 0
-        self.merge_counts = None
-        # Optional revival buffer (disabled by default)
-        self.use_buffer = True
-        # Buffer stores only global ids and ages; snapshots optional
-        self.buffer_ids = []   # list[int]
-        self.buffer_age = []   # list[int]
-        # Snapshots used by external det2buffer_mat computation (Scheme A)
-        self.buffer_queries = []  # list[Tensor[C]]
-        self.buffer_bboxes = []   # list[Tensor[6]]
-        self.buffer_cats = []     # list[Tensor[]]
-        # Additional snapshots for strict revival
-        self.buffer_scores = []       # list[Tensor[1]] or scalar tensor
-        self.buffer_track_age = []    # list[Tensor[1]] or scalar tensor
-        self.buffer_long_track = []   # list[Tensor[1]] bool
-        self.buffer_active = []       # list[Tensor[1]] bool
+        # Buffer for track revival (optional).
+        self.buffer_ids = []
+        self.buffer_age = []
+        self.buffer_queries = []
+        self.buffer_bboxes = []
+        self.buffer_cats = []
+        self.buffer_scores = []
+        self.buffer_track_age = []
+        self.buffer_long_track = []
+        self.buffer_active = []
+        self.last_stats = None
+        # Optional: bbox/center diagnostics for threshold selection (side-channel only).
+        self.diag_cfg = diag_cfg if isinstance(diag_cfg, dict) else {}
+        self.diag_enable = bool(self.diag_cfg.get("enable", False))
+        self.diag_frame_stride = int(self.diag_cfg.get("frame_stride", 5))
+        self.diag_neg_k = int(self.diag_cfg.get("neg_k", 3))
+        self.diag_tt_frame_stride = int(self.diag_cfg.get("track_track_frame_stride", self.diag_frame_stride))
+        self.diag_tt_max_pairs = int(self.diag_cfg.get("track_track_max_pairs", 2000))
+        self.diag_topk_tracks = int(self.diag_cfg.get("topk_tracks_per_det", 50))
+        self.diag_with_feat = bool(self.diag_cfg.get("with_feat", True))
+        self.diag_with_voxel = bool(self.diag_cfg.get("with_voxel", False))
+        self.diag_voxel_size = float(self.diag_cfg.get("voxel_size", 0.12))
+        self.diag_det_vox_cap = int(self.diag_cfg.get("det_vox_cap", 512))
+        self.diag_trk_vox_cap = int(self.diag_cfg.get("trk_vox_cap", 2048))
+        self._track_gt_votes = {}  # gid -> {gt_id: count}
+        self._track_voxels = {}  # gid -> 1D int64 voxel ids (cpu, unique)
+        self._diag = None
+        if self.diag_enable:
+            self._diag = {
+                # each item: (bbox_iou, center_norm, feat_sim) when diag_with_feat else (bbox_iou, center_norm)
+                "det_track": {"pos": [], "neg": []},
+                "track_track": {"pos": [], "neg": []},
+                "meta": {"frames_seen": 0, "pos_pairs": 0, "neg_pairs": 0},
+            }
+
+    def export_bbox_center_diag(self):
+        if not self.diag_enable or not isinstance(self._diag, dict):
+            return None
+        try:
+            # Convert lists to numpy arrays for compact storage.
+            def _to_arr(xs):
+                if not xs:
+                    cols = 2 + (1 if bool(self.diag_with_feat) else 0) + (1 if bool(self.diag_with_voxel) else 0)
+                    return np.zeros((0, cols), dtype=np.float32)
+                return np.asarray(xs, dtype=np.float32)
+            out = {
+                "cfg": dict(self.diag_cfg),
+                "det_track_pos": _to_arr(self._diag["det_track"]["pos"]),
+                "det_track_neg": _to_arr(self._diag["det_track"]["neg"]),
+                "track_track_pos": _to_arr(self._diag["track_track"]["pos"]),
+                "track_track_neg": _to_arr(self._diag["track_track"]["neg"]),
+                "meta": dict(self._diag.get("meta", {})),
+            }
+            return out
+        except Exception:
+            return None
+
+    @staticmethod
+    def _mode_gt_ids(gt_ids: torch.Tensor) -> int:
+        """Compute mode of non-negative gt ids; return -1 if empty."""
+        if gt_ids is None or gt_ids.numel() == 0:
+            return -1
+        gt_ids = gt_ids.to(dtype=torch.long)
+        gt_ids = gt_ids[gt_ids >= 0]
+        if gt_ids.numel() == 0:
+            return -1
+        uniq, cnt = torch.unique(gt_ids, return_counts=True)
+        return int(uniq[torch.argmax(cnt)].item())
+
+    def _get_track_gt(self, gid: int) -> int:
+        votes = self._track_gt_votes.get(int(gid), None)
+        if not isinstance(votes, dict) or len(votes) == 0:
+            return -1
+        best_gt = -1
+        best_cnt = -1
+        for k, v in votes.items():
+            try:
+                if int(v) > best_cnt:
+                    best_cnt = int(v)
+                    best_gt = int(k)
+            except Exception:
+                continue
+        return int(best_gt) if best_cnt > 0 else -1
+
+    def _add_track_vote(self, gid: int, gt_id: int):
+        if gt_id is None:
+            return
+        gid = int(gid)
+        gt_id = int(gt_id)
+        if gt_id < 0:
+            return
+        d = self._track_gt_votes.get(gid, None)
+        if not isinstance(d, dict):
+            d = {}
+            self._track_gt_votes[gid] = d
+        d[gt_id] = int(d.get(gt_id, 0)) + 1
+
+    @staticmethod
+    def _pack_vox_ids(points_xyz: torch.Tensor, voxel_size: float) -> torch.Tensor:
+        """Pack quantized xyz into int64 voxel ids.
+
+        Uses 21-bit packing per axis after bias; collision-free for typical indoor ranges.
+        """
+        if points_xyz.numel() == 0:
+            return torch.zeros((0,), dtype=torch.int64, device=points_xyz.device)
+        q = torch.floor(points_xyz / float(voxel_size)).to(dtype=torch.int64)
+        bias = (1 << 20)
+        q = q + bias
+        return (q[:, 0] << 42) | (q[:, 1] << 21) | q[:, 2]
+
+    @staticmethod
+    def _cap_unique_cpu(ids_cpu: torch.Tensor, cap: int) -> torch.Tensor:
+        if ids_cpu is None or not torch.is_tensor(ids_cpu) or ids_cpu.numel() == 0:
+            return torch.zeros((0,), dtype=torch.int64)
+        ids_cpu = ids_cpu.to(dtype=torch.int64, device="cpu")
+        ids_cpu = torch.unique(ids_cpu)
+        if cap is not None and int(cap) > 0 and ids_cpu.numel() > int(cap):
+            perm = torch.randperm(ids_cpu.numel())[: int(cap)]
+            ids_cpu = ids_cpu[perm]
+        return ids_cpu
+
+    def _det_vox_ids(self, frame_points_xyz: torch.Tensor, det_mask: torch.Tensor) -> torch.Tensor:
+        if frame_points_xyz is None or det_mask is None:
+            return torch.zeros((0,), dtype=torch.int64)
+        if not torch.is_tensor(frame_points_xyz) or not torch.is_tensor(det_mask):
+            return torch.zeros((0,), dtype=torch.int64)
+        if det_mask.numel() != int(frame_points_xyz.shape[0]):
+            return torch.zeros((0,), dtype=torch.int64)
+        pts = frame_points_xyz[det_mask].to(dtype=torch.float32)
+        if pts.numel() == 0:
+            return torch.zeros((0,), dtype=torch.int64)
+        vids = self._pack_vox_ids(pts, self.diag_voxel_size)
+        return self._cap_unique_cpu(vids.detach().cpu(), self.diag_det_vox_cap)
+
+    def _update_track_voxels(self, gid: int, det_vox: torch.Tensor):
+        if not self.diag_with_voxel:
+            return
+        gid = int(gid)
+        if gid < 0:
+            return
+        det_vox = det_vox.to(dtype=torch.int64, device="cpu")
+        if det_vox.numel() == 0:
+            return
+        old = self._track_voxels.get(gid, None)
+        if old is None or (not torch.is_tensor(old)) or old.numel() == 0:
+            self._track_voxels[gid] = self._cap_unique_cpu(det_vox, self.diag_trk_vox_cap)
+            return
+        merged = torch.cat([old.to(dtype=torch.int64, device="cpu"), det_vox], dim=0)
+        self._track_voxels[gid] = self._cap_unique_cpu(merged, self.diag_trk_vox_cap)
+
+    @staticmethod
+    def _contain_any(a: torch.Tensor, b: torch.Tensor) -> float:
+        """Directional containment: max(|A∩B|/|A|, |A∩B|/|B|)."""
+        if a is None or b is None or (not torch.is_tensor(a)) or (not torch.is_tensor(b)):
+            return 0.0
+        if a.numel() == 0 or b.numel() == 0:
+            return 0.0
+        a = a.to(device="cpu", dtype=torch.int64)
+        b = b.to(device="cpu", dtype=torch.int64)
+        # a,b are unique; use numpy intersect for speed.
+        a_np = a.numpy()
+        b_np = b.numpy()
+        inter = np.intersect1d(a_np, b_np, assume_unique=True).size
+        ca = float(inter) / float(max(int(a_np.size), 1))
+        cb = float(inter) / float(max(int(b_np.size), 1))
+        return float(max(ca, cb))
     
     def clean(self):
         self.cur_masks = None
@@ -373,6 +526,7 @@ class DQ_Track_OnlineMerge():
         self.buffer_track_age = []
         self.buffer_long_track = []
         self.buffer_active = []
+        self.last_stats = None
 
     def get_buffer_snapshots(self, device=None):
         """Expose buffer snapshots for external det2buffer_mat computation.
@@ -399,7 +553,7 @@ class DQ_Track_OnlineMerge():
             buf_c = None
         return buf_ids, buf_q, buf_b, buf_c
   
-    def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes, det2track_mat, det2buffer_mat, track_instances, track_embedding_for_update, current_max_track_id, det_category, ema_decay_rate=0.5, asso_thres=0.1, miss_thres=50):
+    def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes, det2track_mat, det2buffer_mat, track_instances, track_embedding_for_update, current_max_track_id, det_category, ema_decay_rate=0.5, asso_thres=0.1, miss_thres=50, gt_inst=None, frame_idx=None, frame_points_xyz=None):
         points_per_mask = masks.shape[1]
         # masks, labels, scores, queries, query_feats, sem_preds, xyz_list = \
         #     self.intra_frame_merge(masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes, q)
@@ -415,9 +569,24 @@ class DQ_Track_OnlineMerge():
             # batch_idx = 0
             # valid_track = track_instances.valid_track[batch_idx]
             # track_instances.queries[valid_track] = track_embedding_for_update
+            # Monitoring: first frame has no matching yet; treat all dets as births.
+            try:
+                batch_idx = 0
+                self.last_stats = {
+                    "det": int(masks.shape[0]),
+                    "track_valid_before": int(track_instances.valid_track[batch_idx].sum().item()),
+                    "matched": 0,
+                    "revived": 0,
+                    "birth": int(masks.shape[0]),
+                    "buffer_size": int(len(self.buffer_ids)),
+                    "use_bbox": bool(self.use_bbox),
+                }
+            except Exception:
+                self.last_stats = None
         else:
             self.fi += 1
             batch_idx = 0
+            cur_frame_idx = int(frame_idx) if frame_idx is not None else int(self.fi)
             next_masks, next_labels, next_scores, next_queries, next_query_feats, next_sem_preds, next_xyz = \
                 masks, labels, scores, queries, query_feats, sem_preds, \
                 self._bbox_pred_to_bbox(xyz_list, bboxes) if self.use_bbox else xyz_list
@@ -438,6 +607,7 @@ class DQ_Track_OnlineMerge():
                     self.buffer_long_track = [lt for lt, k in zip(self.buffer_long_track, keep_mask) if k]
                     self.buffer_active = [ac for ac, k in zip(self.buffer_active, keep_mask) if k]
             valid_track_idx = track_instances.valid_track[batch_idx].nonzero(as_tuple=True)[0]
+            track_valid_before = int(valid_track_idx.numel())
             track_category = track_instances.category[batch_idx][valid_track_idx]
             invalid_mask = torch.ones((valid_track_idx.shape[0], next_labels.shape[0])).to(self.cur_labels.device)
             for i in range(valid_track_idx.shape[0]):
@@ -478,6 +648,228 @@ class DQ_Track_OnlineMerge():
             col_ind = col_ind[mix_scores_mask]
             match_dets = col_ind
             match_tracks = valid_track_idx[row_ind]
+
+            # Optional: update track->GT votes (method A) using current Hungarian matches.
+            if self.diag_enable and gt_inst is not None and torch.is_tensor(gt_inst):
+                try:
+                    for t_slot, d_id in zip(match_tracks.tolist(), match_dets.tolist()):
+                        gid = int(track_instances.global_track_id[batch_idx][t_slot].item())
+                        if gid < 0:
+                            continue
+                        det_mask = next_masks[d_id]
+                        if det_mask.numel() != gt_inst.numel():
+                            continue
+                        det_gt = self._mode_gt_ids(gt_inst[det_mask])
+                        self._add_track_vote(gid, det_gt)
+                        if self.diag_with_voxel and frame_points_xyz is not None:
+                            det_vox = self._det_vox_ids(frame_points_xyz, det_mask)
+                            self._update_track_voxels(gid, det_vox)
+                except Exception:
+                    pass
+
+            # Optional: bbox/center threshold diagnostics (GT-view pos/neg pairs).
+            if (
+                self.diag_enable
+                and isinstance(self._diag, dict)
+                and gt_inst is not None
+                and torch.is_tensor(gt_inst)
+                and (cur_frame_idx % int(max(self.diag_frame_stride, 1)) == 0)
+                and self.use_bbox
+                and xyz_scores.numel() > 0
+            ):
+                try:
+                    # Build det_gt ids
+                    gt_inst = gt_inst.to(device=next_masks.device, dtype=torch.long)
+                    det_gt = []
+                    for d in range(int(next_masks.shape[0])):
+                        m = next_masks[d]
+                        if m.numel() != gt_inst.numel():
+                            det_gt.append(-1)
+                        else:
+                            det_gt.append(self._mode_gt_ids(gt_inst[m]))
+                    det_gt = torch.as_tensor(det_gt, device=next_masks.device, dtype=torch.long)  # [D]
+                    det_vox_list = None
+                    if self.diag_with_voxel and frame_points_xyz is not None:
+                        try:
+                            det_vox_list = [self._det_vox_ids(frame_points_xyz, next_masks[d]) for d in range(int(next_masks.shape[0]))]
+                        except Exception:
+                            det_vox_list = None
+
+                    # Track gt ids for valid tracks
+                    gids = track_instances.global_track_id[batch_idx][valid_track_idx].to(dtype=torch.long)
+                    trk_gt = torch.full((int(gids.numel()),), -1, device=next_masks.device, dtype=torch.long)
+                    for i in range(int(gids.numel())):
+                        gid = int(gids[i].item())
+                        if gid >= 0:
+                            trk_gt[i] = int(self._get_track_gt(gid))
+
+                    # Center norm matrix
+                    trk_param = track_instances.bboxes[batch_idx][valid_track_idx]  # [T,6] center+size
+                    trk_cent = trk_param[:, :3]
+                    trk_size = trk_param[:, 3:6].clamp(min=1e-6)
+                    trk_diag = torch.norm(trk_size, dim=1).clamp(min=1e-6)  # [T]
+                    det_cent = (next_xyz[:, 0:3] + next_xyz[:, 3:6]) * 0.5  # [D,3]
+                    center_norm = torch.cdist(trk_cent, det_cent, p=2) / trk_diag.unsqueeze(1)  # [T,D]
+                    feat_sim = None
+                    if bool(self.diag_with_feat) and det2track_mat is not None and torch.is_tensor(det2track_mat):
+                        try:
+                            feat_sim = det2track_mat.T  # [T,D] already aligned with valid tracks ordering
+                            feat_sim = feat_sim.to(device=next_masks.device, dtype=torch.float32)
+                            # Clamp to a sane range for threshold scan; keep sign for debugging if needed.
+                            feat_sim = torch.clamp(feat_sim, min=-1.0, max=1.0)
+                        except Exception:
+                            feat_sim = None
+
+                    # Sample per det: best pos pair + hardest neg_k pairs by bbox_iou.
+                    T = int(xyz_scores.shape[0])
+                    D = int(xyz_scores.shape[1])
+                    topk_tracks = int(min(max(self.diag_topk_tracks, 1), T))
+                    for d in range(D):
+                        g = int(det_gt[d].item())
+                        if g < 0:
+                            continue
+                        # restrict to tracks with known gt
+                        known = trk_gt >= 0
+                        if int(known.sum().item()) == 0:
+                            continue
+                        # pick top-k tracks by bbox_iou for this det to control cost
+                        vals, idxs = torch.topk(xyz_scores[:, d], k=topk_tracks, largest=True)
+                        idxs = idxs.tolist()
+                        # pos among topk
+                        best_pos = None
+                        best_t = None
+                        for t in idxs:
+                            if not bool(known[t].item()):
+                                continue
+                            if int(trk_gt[t].item()) == g:
+                                iou = float(xyz_scores[t, d].item())
+                                cn = float(center_norm[t, d].item())
+                                fs = float(feat_sim[t, d].item()) if feat_sim is not None else 0.0
+                                if best_pos is None or iou > best_pos[0]:
+                                    best_pos = (iou, cn, fs) if bool(self.diag_with_feat) else (iou, cn)
+                                    best_t = int(t)
+                        if best_pos is not None:
+                            if self.diag_with_voxel and det_vox_list is not None and best_t is not None and bool(known[best_t].item()):
+                                gid = int(gids[best_t].item())
+                                trk_vox = self._track_voxels.get(gid, None)
+                                vox = self._contain_any(det_vox_list[d], trk_vox) if trk_vox is not None else 0.0
+                                if bool(self.diag_with_feat):
+                                    iou, cn, fs = best_pos
+                                    self._diag["det_track"]["pos"].append((float(iou), float(cn), float(fs), float(vox)))
+                                else:
+                                    iou, cn = best_pos
+                                    self._diag["det_track"]["pos"].append((float(iou), float(cn), float(vox)))
+                            else:
+                                self._diag["det_track"]["pos"].append(best_pos)
+                        # negatives: hardest by bbox_iou among non-matching gt
+                        neg_added = 0
+                        for t in idxs:
+                            if neg_added >= int(max(self.diag_neg_k, 0)):
+                                break
+                            if not bool(known[t].item()):
+                                continue
+                            if int(trk_gt[t].item()) != g:
+                                iou = float(xyz_scores[t, d].item())
+                                cn = float(center_norm[t, d].item())
+                                fs = float(feat_sim[t, d].item()) if feat_sim is not None else 0.0
+                                if self.diag_with_voxel and det_vox_list is not None:
+                                    gid = int(gids[t].item())
+                                    trk_vox = self._track_voxels.get(gid, None)
+                                    vox = self._contain_any(det_vox_list[d], trk_vox) if trk_vox is not None else 0.0
+                                    if bool(self.diag_with_feat):
+                                        self._diag["det_track"]["neg"].append((float(iou), float(cn), float(fs), float(vox)))
+                                    else:
+                                        self._diag["det_track"]["neg"].append((float(iou), float(cn), float(vox)))
+                                else:
+                                    self._diag["det_track"]["neg"].append((iou, cn, fs) if bool(self.diag_with_feat) else (iou, cn))
+                                neg_added += 1
+
+                    self._diag["meta"]["frames_seen"] = int(self._diag["meta"].get("frames_seen", 0)) + 1
+                    self._diag["meta"]["pos_pairs"] = int(len(self._diag["det_track"]["pos"]))
+                    self._diag["meta"]["neg_pairs"] = int(len(self._diag["det_track"]["neg"]))
+                except Exception:
+                    pass
+
+            # Optional: track-track bbox/center diagnostics (sampled).
+            if (
+                self.diag_enable
+                and isinstance(self._diag, dict)
+                and (cur_frame_idx % int(max(self.diag_tt_frame_stride, 1)) == 0)
+                and self.use_bbox
+            ):
+                try:
+                    gids_all = track_instances.global_track_id[batch_idx][valid_track_idx].to(dtype=torch.long)
+                    trk_gt_all = []
+                    keep = []
+                    for gid in gids_all.tolist():
+                        g = self._get_track_gt(int(gid))
+                        trk_gt_all.append(int(g))
+                        keep.append(int(g) >= 0)
+                    keep = torch.as_tensor(keep, device=valid_track_idx.device, dtype=torch.bool)
+                    if int(keep.sum().item()) >= 2:
+                        sel_slots = valid_track_idx[keep]
+                        sel_gt = torch.as_tensor([g for g, k in zip(trk_gt_all, keep.tolist()) if k],
+                                                 device=next_masks.device, dtype=torch.long)
+                        # compute bbox iou matrix among selected tracks
+                        trk_boxes = bbox_pred_to_bbox(track_instances.bboxes[batch_idx][sel_slots])  # [K,6]
+                        iou_tt = self.iou_calculator(trk_boxes, trk_boxes, is_aligned=False)  # [K,K]
+                        # center norm
+                        trk_param = track_instances.bboxes[batch_idx][sel_slots]
+                        trk_cent = trk_param[:, :3]
+                        trk_size = trk_param[:, 3:6].clamp(min=1e-6)
+                        trk_diag = torch.norm(trk_size, dim=1).clamp(min=1e-6)
+                        dist = torch.cdist(trk_cent, trk_cent, p=2)
+                        cn_tt = dist / trk_diag.unsqueeze(1)
+                        q_tt = None
+                        if bool(self.diag_with_feat):
+                            try:
+                                q = track_instances.queries[batch_idx][sel_slots].to(dtype=torch.float32)
+                                q = torch.nn.functional.normalize(q, dim=1)
+                                q_tt = q @ q.t()  # [K,K]
+                                q_tt = torch.clamp(q_tt, min=-1.0, max=1.0)
+                            except Exception:
+                                q_tt = None
+
+                        K = int(sel_gt.numel())
+                        # sample upper-tri pairs with highest iou to focus on likely duplicates
+                        triu = torch.triu_indices(K, K, offset=1, device=next_masks.device)
+                        pair_iou = iou_tt[triu[0], triu[1]]
+                        if pair_iou.numel() == 0:
+                            pass
+                        else:
+                            max_pairs = int(min(int(pair_iou.numel()), int(max(self.diag_tt_max_pairs, 1))))
+                            vals, order = torch.topk(pair_iou, k=max_pairs, largest=True)
+                            for idx in order.tolist():
+                                a = int(triu[0, idx].item())
+                                b = int(triu[1, idx].item())
+                                iou = float(iou_tt[a, b].item())
+                                cn = float(cn_tt[a, b].item())
+                                fs = float(q_tt[a, b].item()) if q_tt is not None else 0.0
+                                vox = 0.0
+                                if self.diag_with_voxel:
+                                    gid_a = int(track_instances.global_track_id[batch_idx][sel_slots[a]].item())
+                                    gid_b = int(track_instances.global_track_id[batch_idx][sel_slots[b]].item())
+                                    va = self._track_voxels.get(gid_a, None)
+                                    vb = self._track_voxels.get(gid_b, None)
+                                    vox = self._contain_any(va, vb)
+                                if int(sel_gt[a].item()) == int(sel_gt[b].item()):
+                                    if self.diag_with_voxel:
+                                        if bool(self.diag_with_feat):
+                                            self._diag["track_track"]["pos"].append((float(iou), float(cn), float(fs), float(vox)))
+                                        else:
+                                            self._diag["track_track"]["pos"].append((float(iou), float(cn), float(vox)))
+                                    else:
+                                        self._diag["track_track"]["pos"].append((iou, cn, fs) if bool(self.diag_with_feat) else (iou, cn))
+                                else:
+                                    if self.diag_with_voxel:
+                                        if bool(self.diag_with_feat):
+                                            self._diag["track_track"]["neg"].append((float(iou), float(cn), float(fs), float(vox)))
+                                        else:
+                                            self._diag["track_track"]["neg"].append((float(iou), float(cn), float(vox)))
+                                    else:
+                                        self._diag["track_track"]["neg"].append((iou, cn, fs) if bool(self.diag_with_feat) else (iou, cn))
+                except Exception:
+                    pass
             # DQ_Track
             # det_category = next_labels
             # track_category = track_instances.obj_labels[batch_idx][valid_track_idx]
@@ -547,6 +939,9 @@ class DQ_Track_OnlineMerge():
             else:
                 unmatched_dets = torch.arange(0, next_masks.shape[0]).to(next_masks.device)
                 unmatched_tracks = torch.arange(0, self.cur_masks.shape[0]).to(self.cur_masks.device)
+            unmatched_dets_before_revive = int(unmatched_dets.numel())
+            revived_cnt = 0
+            dead_to_buffer_cnt = 0
 
             # Try to revive from buffer by matching unmatched detections to buffered tracks
             if self.use_buffer and (unmatched_dets.numel() > 0) and (len(self.buffer_ids) > 0):
@@ -592,6 +987,7 @@ class DQ_Track_OnlineMerge():
                 r_col = r_col[valid]
 
                 if r_row.numel() > 0:
+                    revived_cnt = int(r_row.numel())
                     # allocate empty slots
                     empty_mask = ~track_instances.valid_track[batch_idx]
                     need = r_row.numel()
@@ -699,6 +1095,7 @@ class DQ_Track_OnlineMerge():
                 track_instances.global_track_id[batch_idx][empty_track] = current_max_track_id + torch.arange(0, len(unmatched_dets)).to(self.cur_masks.device)
                 track_instances.category[batch_idx][empty_track] = det_category[unmatched_dets]
                 current_max_track_id += len(unmatched_dets)
+            birth_cnt = int(unmatched_dets.numel())
             if len(unmatched_tracks) > 0:
                 track_instances.disappear_time[batch_idx][unmatched_tracks] += 1
             # assert track_instances.disappear_time[batch_idx].max() <= miss_thres + 1, "track_instances.disappear_time[batch_idx].max() > miss_thres + 1"
@@ -730,6 +1127,7 @@ class DQ_Track_OnlineMerge():
                             self.buffer_track_age.append(ta.detach())
                             self.buffer_long_track.append(lt.detach())
                             self.buffer_active.append(ac.detach())
+                    dead_to_buffer_cnt = int(valid_mask.sum().item()) if torch.is_tensor(valid_mask) else 0
 
                 # free slots as original behavior
                 track_instances.valid_track[batch_idx][dead_track] = False
@@ -742,6 +1140,23 @@ class DQ_Track_OnlineMerge():
                 track_instances.scores[batch_idx][dead_track] = torch.zeros_like(track_instances.scores[batch_idx][dead_track])
                 track_instances.obj_labels[batch_idx][dead_track] = torch.zeros_like(track_instances.obj_labels[batch_idx][dead_track])
                 track_instances.global_track_id[batch_idx][dead_track] = -1 * torch.ones_like(track_instances.global_track_id[batch_idx][dead_track])
+            # Monitoring snapshot (side-channel): consumed by outer predict() loop.
+            try:
+                self.last_stats = {
+                    "det": int(next_masks.shape[0]),
+                    "track_valid_before": int(track_valid_before),
+                    "matched": int(len(match_dets)),
+                    "unmatched_dets_before_revive": int(unmatched_dets_before_revive),
+                    "revived": int(revived_cnt),
+                    "birth": int(birth_cnt),
+                    "unmatched_tracks": int(unmatched_tracks.numel()) if torch.is_tensor(unmatched_tracks) else int(len(unmatched_tracks)),
+                    "dead_to_buffer": int(dead_to_buffer_cnt),
+                    "buffer_size": int(len(self.buffer_ids)),
+                    "track_valid_after": int(track_instances.valid_track[batch_idx].sum().item()),
+                    "use_bbox": bool(self.use_bbox),
+                }
+            except Exception:
+                self.last_stats = None
         if len(self.cur_scores) > self.inscat_topk_insts:
             _, kept_ins = self.cur_scores.topk(self.inscat_topk_insts)
         else:

@@ -5,11 +5,21 @@ from torch import nn as nn
 from torch.nn import functional as F
 import torchvision
 import pdb
-from ultralytics.yolo.utils import is_git_dir
-from ultralytics.yolo.utils import ops
-from ultralytics.yolo.utils.torch_utils import select_device, smart_inference_mode
-from ultralytics.yolo.v8.segment import SegmentationPredictor
-from ultralytics.yolo.cfg import get_cfg
+
+# Ultralytics has changed internal module paths across versions.
+try:
+    from ultralytics.utils import ops
+    from ultralytics.utils.torch_utils import select_device, smart_inference_mode
+    from ultralytics.models.yolo.segment import SegmentationPredictor
+    from ultralytics.cfg import get_cfg
+except Exception:  # pragma: no cover
+    from ultralytics.yolo.utils import ops  # type: ignore
+    from ultralytics.yolo.utils.torch_utils import (  # type: ignore
+        select_device,
+        smart_inference_mode,
+    )
+    from ultralytics.yolo.v8.segment import SegmentationPredictor  # type: ignore
+    from ultralytics.yolo.cfg import get_cfg  # type: ignore
 import sys
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS

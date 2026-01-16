@@ -2,14 +2,17 @@
 import argparse
 import os
 import os.path as osp
+import sys
+
+# Ensure the repo root (containing `oneformer3d/`) is importable when running
+# `python tools/test.py ...` from anywhere.
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..')))
 
 from mmengine.config import Config, ConfigDict, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet3d.utils import replace_ceph_backend
-import sys
-sys.path.append('/home/hswang/AD/vfm/ESAM')
 import oneformer3d
 
 # TODO: support fuse_conv_bn and format_only

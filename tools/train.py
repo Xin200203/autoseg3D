@@ -3,6 +3,11 @@ import argparse
 import logging
 import os
 import os.path as osp
+import sys
+
+# Ensure the repo root (containing `oneformer3d/`) is importable when running
+# `python tools/train.py ...` from anywhere.
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..')))
 
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log
@@ -28,9 +33,6 @@ def _safe_update_params(self, loss, **kwargs):
 
 # 打补丁
 OptimWrapper.update_params = _safe_update_params
-import sys
-sys.path.append('/home/hswang/AD/vfm/ESAM')
-
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a 3D detector')
     parser.add_argument('config', help='train config file path')

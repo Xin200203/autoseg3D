@@ -404,7 +404,7 @@ param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
 
 # choose a best stage1
-load_from = 'work_dirs/best.pth'
+load_from = 'work_dirs/AutoSeg3D_scannet200_stage1/epoch_128.pth'
 
 # training schedule for 1x
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=36, val_interval=4)

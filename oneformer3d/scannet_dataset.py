@@ -10,9 +10,15 @@ from mmdet3d.registry import DATASETS
 class ScanNetSegDataset_(ScanNetSegDataset):
     """We just add super_pts_path."""
 
+    def __init__(self, *args, load_interval: int = 1, **kwargs):
+        # Some configs pass `load_interval` to subsample scenes for faster
+        # training/validation.
+        self.load_interval = max(int(load_interval), 1)
+        super().__init__(*args, **kwargs)
+
     def get_scene_idxs(self, *args, **kwargs):
         """Compute scene_idxs for data sampling."""
-        return np.arange(len(self)).astype(np.int32)
+        return np.arange(0, len(self), self.load_interval).astype(np.int32)
 
     def parse_data_info(self, info: dict) -> dict:
         """Process the raw data info.
