@@ -169,6 +169,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
                  cat_rec=False,
                  use_FF=False,
                  keep_img_paths_poses: bool = False,
+                 rec_data_root: Optional[str] = None,
                  backend_args: Optional[dict] = None,
                  dataset_type = 'scannet200') -> None:
         self.shift_height = shift_height
@@ -200,6 +201,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
         # projection/2D-backbone diagnostics without loading images in dataloader.
         # Default False to preserve original behavior.
         self.keep_img_paths_poses = bool(keep_img_paths_poses)
+        self.rec_data_root = rec_data_root
         self.backend_args = backend_args
         self.dataset_type = dataset_type
         
@@ -319,9 +321,13 @@ class LoadAdjacentDataFromFile(BaseTransform):
             dict: The dict containing loaded 3D mask annotations.
         """
         scene_name = pts_filenames[0].split('/')[-2]
-        rec_pts_filename = 'data/' + self.dataset_type + '/points/' + scene_name + '.bin'
-        rec_ins_path = 'data/' + self.dataset_type + '/instance_mask/' + scene_name + '.bin'
-        rec_sem_path = 'data/' + self.dataset_type + '/semantic_mask/' + scene_name + '.bin'
+        if self.rec_data_root:
+            rec_root = os.path.abspath(os.path.expanduser(self.rec_data_root))
+        else:
+            rec_root = os.path.join('data', self.dataset_type)
+        rec_pts_filename = os.path.join(rec_root, 'points', scene_name + '.bin')
+        rec_ins_path = os.path.join(rec_root, 'instance_mask', scene_name + '.bin')
+        rec_sem_path = os.path.join(rec_root, 'semantic_mask', scene_name + '.bin')
         try:
             rec_pts = np.frombuffer(get(rec_pts_filename, backend_args=self.backend_args), dtype=np.float32)
             rec_ins = np.frombuffer(get(rec_ins_path, backend_args=self.backend_args), dtype=np.int64)
@@ -331,13 +337,17 @@ class LoadAdjacentDataFromFile(BaseTransform):
             rec_ins = np.fromfile(rec_ins_path, dtype=np.int64)
             rec_sem = np.fromfile(rec_sem_path, dtype=np.int64)
         if self.dataset_type == 'scannet' or self.dataset_type == 'scannet200':
-            segment_path = 'data/' + self.dataset_type + '/scans/' + scene_name + '/' + scene_name + '_vh_clean_2.0.010000.segs.json'
+            segment_path = os.path.join(
+                rec_root, 'scans', scene_name, scene_name + '_vh_clean_2.0.010000.segs.json'
+            )
             segment_ids = np.array(json.load(open(segment_path))['segIndices'])
         if self.dataset_type == '3RScan':
-            segment_path = 'data/' + self.dataset_type + '/3RScan/' + scene_name + '/' + 'mesh.refined.0.010000.segs.v2.json'
+            segment_path = os.path.join(
+                rec_root, '3RScan', scene_name, 'mesh.refined.0.010000.segs.v2.json'
+            )
             segment_ids = np.array(json.load(open(segment_path))['segIndices'])
         if self.dataset_type == 'scenenn':
-            segment_path = 'data/' + self.dataset_type + '/mesh_segs/' + scene_name + '.segs.json'
+            segment_path = os.path.join(rec_root, 'mesh_segs', scene_name + '.segs.json')
             segment_ids = np.array(json.load(open(segment_path))['segIndices'])
 
         rec_pts = rec_pts.reshape(-1, self.load_dim).copy()

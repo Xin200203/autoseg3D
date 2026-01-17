@@ -160,6 +160,10 @@ class QueryDecoder(BaseModule):
                  dropout, activation_fn, iter_pred, attn_mask, fix_attention,
                  objectness_flag, use_track_loss=False, **kwargs):
         super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.fix_attention = fix_attention
         self.objectness_flag = objectness_flag
         self.input_proj = nn.Sequential(
             nn.Linear(in_channels, d_model), nn.LayerNorm(d_model), nn.ReLU())
@@ -488,7 +492,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
     def __init__(self, num_instance_classes, num_semantic_classes,
                  d_model, num_semantic_linears, in_channels, share_attn_mlp, share_mask_mlp,
                  cross_attn_mode, mask_pred_mode, temporal_attn=False, bbox_flag=False, 
-                 use_query_memory2=False, query_stage=[0],use_track_loss=False, use_temporal_loss=False, use_decouple=False, use_mot=False, mot_type=None, **kwargs):
+                 use_query_memory2=False, query_stage=[0],use_track_loss=False, use_temporal_loss=False,
+                 use_decouple=False, use_mot=False, mot_type=None, gdino_daca2d=None, **kwargs):
         super().__init__(
             num_classes=num_instance_classes, d_model=d_model, in_channels=in_channels,use_track_loss=use_track_loss, **kwargs)
         assert num_semantic_linears in [1, 2]
@@ -553,12 +558,84 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         if self.use_decouple:
             # self.query_inter = QueryInteractionX(256, 256)
             self.query_inter = MultiScaleQuery(embed_dims=256)
+        # GDINO DACA-2D config (optional, default disabled)
+        self.gdino_daca2d_cfg = gdino_daca2d or {}
+        # Dedicated 2D query cross-attn layers (same depth as 3D decoder)
+        self.dino_query_cross_attn_layers = nn.ModuleList([
+            CrossAttentionLayer(self.d_model, self.num_heads, self.dropout, fix=self.fix_attention)
+            for _ in range(len(self.cross_attn_layers))
+        ])
     def reset_decouple(self):
         """Reset the decouple module.
         """
         if self.use_decouple:
             self.before_query_memory = None
             self.before_query_boxes = None
+
+    def _daca_layer_enabled(self, layer_idx, attn_mask, cfg):
+        """Check if DACA-2D should run at this layer (SP-domain only)."""
+        if not isinstance(cfg, dict):
+            return False
+        if cfg.get("inject_domain", "sp") != "sp":
+            return False
+        inject_layers = cfg.get("inject_layers", "auto_sp")
+        if inject_layers == "auto_sp":
+            return self.mask_pred_mode[layer_idx] == "SP"
+        if isinstance(inject_layers, (list, tuple)):
+            return layer_idx in inject_layers
+        return False
+
+    def _apply_daca2d(self, queries, attn_mask, query2d_feats, query2d_pos,
+                       sp_pos_list, cfg, layer_idx: int):
+        """Apply DACA-2D cross-attention (SP-domain only).
+
+        Args:
+            queries: List[Tensor] length B, each (Nq3d, D).
+            attn_mask: List[Tensor] length B, each (Nq3d, Nsp) bool.
+            query2d_feats: List[Tensor] length B, each (Nq2d, D).
+            query2d_pos: List[Tensor] length B, each (Nq2d, 3).
+            sp_pos_list: List[Tensor] length B, each (Nsp, 3).
+            cfg: gdino_daca2d config dict.
+        """
+        if not self._daca_layer_enabled(layer_idx, attn_mask, cfg):
+            return queries
+        if attn_mask is None or sp_pos_list is None:
+            return queries
+        if not (isinstance(query2d_feats, (list, tuple)) and isinstance(query2d_pos, (list, tuple))):
+            return queries
+        if len(query2d_feats) < len(queries) or len(query2d_pos) < len(queries):
+            return queries
+
+        mask_cfg = cfg.get("mask", {}) if isinstance(cfg, dict) else {}
+        thr = float(mask_cfg.get("thr", 0.2))
+        metric = str(mask_cfg.get("metric", "l1")).lower()
+        p = 1 if metric == "l1" else 2
+
+        daca_masks, q2d_list = [], []
+        for b in range(len(queries)):
+            attn_b = attn_mask[b]
+            sp_pos = sp_pos_list[b]
+            q2d = query2d_feats[b]
+            q2d_pos = query2d_pos[b]
+            if not torch.is_tensor(attn_b) or not torch.is_tensor(sp_pos):
+                return queries
+            if not torch.is_tensor(q2d) or not torch.is_tensor(q2d_pos):
+                return queries
+            if attn_b.numel() == 0 or sp_pos.numel() == 0 or q2d_pos.numel() == 0:
+                return queries
+            # Ensure SP mask dimension matches sp_pos
+            if attn_b.shape[1] != sp_pos.shape[0]:
+                return queries
+            dist = torch.cdist(sp_pos, q2d_pos, p=p)
+            reach = (~attn_b).float() @ (dist < thr).float()
+            daca_mask = (reach == 0)
+            # Append dummy query to avoid empty attention rows (SegDINO3D style)
+            q2d = torch.cat([q2d, q2d.new_ones(1, q2d.shape[1])], dim=0)
+            daca_mask = torch.cat([daca_mask, daca_mask.new_zeros(daca_mask.shape[0], 1)], dim=1)
+            q2d_list.append(q2d)
+            daca_masks.append(daca_mask)
+
+        return self.dino_query_cross_attn_layers[layer_idx](q2d_list, queries, daca_masks)
     
     def reset_query_memory2(self):
         """Reset the detector.
@@ -624,7 +701,9 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         sem_preds = sem_preds if last_flag else None
         return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks, object_queries, pred_bboxes
 
-    def forward_iter_pred(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False, inst_dict=None, track_instances=None, use_one2many=False):
+    def forward_iter_pred(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
+                          inst_dict=None, track_instances=None, use_one2many=False,
+                          query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None):
         """Iterative forward pass.
         
         Args:
@@ -670,6 +749,30 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         mask_pts_feats = [self.x_mask(y) if self.share_mask_mlp else self.x_pts_mask(y)
              for y in p_feats] if "P" in self.mask_pred_mode else None # [20000, 99] -> [20000, 256]
         queries = self._get_queries(queries, len(sp_feats)) # [N_segments, 96] -> [N_segments, 256] # ! 这个和inst_feats差不多？
+        # Resolve GDINO DACA-2D config (optional, default disabled)
+        gdino_cfg = gdino_daca2d_cfg or self.gdino_daca2d_cfg or {}
+        use_daca2d = bool(gdino_cfg.get("enable", False)) and query2d_feats is not None and query2d_pos is not None
+        if use_daca2d:
+            # Normalize query2d inputs into per-batch lists.
+            if torch.is_tensor(query2d_feats):
+                query2d_feats = [query2d_feats]
+            if torch.is_tensor(query2d_pos):
+                query2d_pos = [query2d_pos]
+            if not (isinstance(query2d_feats, (list, tuple)) and isinstance(query2d_pos, (list, tuple))):
+                use_daca2d = False
+        # Precompute SP positions when needed (only for SP-domain DACA)
+        sp_pos_list = None
+        if use_daca2d:
+            try:
+                sp_pos_list = []
+                for pf, sp in zip(p_feats, super_points[0]):
+                    xyz = pf[:, :3]
+                    sp_id = sp.to(xyz.device)
+                    sp_pos = scatter_mean(xyz, sp_id, dim=0)
+                    sp_pos_list.append(sp_pos)
+            except Exception:
+                sp_pos_list = None
+                use_daca2d = False
         cls_pred, sem_pred, pred_score, pred_mask, attn_mask, object_query, pred_bbox = \
              self._forward_head(queries, mask_feats, mask_pts_feats, last_flag=False, layer=0)
         cls_preds.append(cls_pred) # [N_segments, 2]
@@ -744,7 +847,18 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             else:
                 raise NotImplementedError("Not support yet!")
 
+            # Optional: DACA-2D injection (paper order = before self-attn)
+            if use_daca2d and gdino_cfg.get("order", "paper") == "paper":
+                queries = self._apply_daca2d(
+                    queries, attn_mask, query2d_feats, query2d_pos, sp_pos_list, gdino_cfg, layer_idx=i
+                )
+
             queries = self.self_attn_layers[i](queries)
+            # Optional: DACA-2D injection (code order = after self-attn)
+            if use_daca2d and gdino_cfg.get("order", "paper") == "code":
+                queries = self._apply_daca2d(
+                    queries, attn_mask, query2d_feats, query2d_pos, sp_pos_list, gdino_cfg, layer_idx=i
+                )
             queries = self.ffn_layers[i](queries)
             if use_one2many:
                 # one2many_queries = self.self_attn_layers[i](one2many_queries)
@@ -832,7 +946,9 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                 bboxes=pred_bboxes[-1],
                 aux_outputs=aux_outputs)
     
-    def forward(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False, inst_dict=False,track_instances=None, use_one2many=False):
+    def forward(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
+                inst_dict=False, track_instances=None, use_one2many=False,
+                query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None):
         """Forward pass.
         
         Args:
@@ -845,7 +961,12 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             Dict: with labels, masks, scores, and possibly aux_outputs.
         """
         if self.iter_pred:
-            return self.forward_iter_pred(sp_feats, p_feats, queries, super_points, prev_queries, use_temporal_loss=use_temporal_loss, inst_dict=inst_dict, track_instances=track_instances, use_one2many=use_one2many)
+            return self.forward_iter_pred(
+                sp_feats, p_feats, queries, super_points, prev_queries,
+                use_temporal_loss=use_temporal_loss, inst_dict=inst_dict,
+                track_instances=track_instances, use_one2many=use_one2many,
+                query2d_feats=query2d_feats, query2d_pos=query2d_pos,
+                gdino_daca2d_cfg=gdino_daca2d_cfg)
         else:
             raise NotImplementedError("No simple forward!!!")
 

@@ -273,6 +273,14 @@ AutoSeg3D 的 MV stage2 数据加载（`LoadAdjacentDataFromFile`）默认不加
 test_cfg.gdino_daca2d = dict(
   enable=False,               # 默认 False
   mode="diag_only",           # diag_only | fuse
+  # decoder layer 的顺序消融：paper=论文顺序；code=SegDINO3D 开源实现顺序
+  order="paper",              # paper | code
+  # V2 约束：DACA‑2D **只在 SP 域注入**（不在 P 域注入）
+  # 解释：DACA‑2D mask 依赖 `attn_mask_sp: [Nq3d, Nsp]`；P 域是 [Nq3d, Np] 无法直接做 (Nq3d×Nsp)@(Nsp×Nq2d)。
+  inject_domain="sp",         # V2 固定为 sp（不开放其它值，避免口径漂移）
+  # 注入层（transformer layer 索引 i=0..L-1）：建议 auto_sp
+  # - AutoSeg3D stage2 默认 mask_pred_mode=["SP","SP","P","P"]，对应可用的 `attn_mask_sp` 出现在 i=0,1（注意：检查的是 mask_pred_mode[i]）。
+  inject_layers="auto_sp",    # auto_sp | [0,1] | []
   frame_stride=1,             # 先做 1（每帧），诊断通过后再考虑 >1
   max_frames=-1,              # -1 不限；可用于 subset 快跑
 
@@ -383,18 +391,61 @@ V2 需要为 decoder 增加两个可选参数（默认 None，不影响现有调
 - `query2d_feats: Optional[List[Tensor]]`（每 batch 一个 `[Nq_keep, 256]`）
 - `query2d_pos: Optional[List[Tensor]]`（每 batch 一个 `[Nq_keep, 3]`，用于 mask）
 
-在每层 decoder 中，参考 SegDINO3D 的结构，插入顺序建议：
+在每层 decoder 中，V2 的目标顺序是（与论文描述对齐）：
 
-1) 现有 BMCA‑3D（你们是 cross_attn_layers 对 inst_feats）
-2) 现有 self-attn + ffn
-3) **新增 DACA‑2D：queries cross-attend to query2d_feats（可选 mask）**
+顺序做消融（两种都支持，默认按论文）：
 
-distance-aware mask（推荐与 SegDINO3D 一致的 L1 距离）：
-- `dist = cdist(sp_pos_wo_elastic, query2d_pos, p=1)`  # shape: [N_sp, Nq]
-- `mask = dist < thr`（再结合当前层的 `attn_mask` 做稀疏化：避免全开/全关）
+**Order=`paper`（论文）**：`3D cross-attn → DACA‑2D → 3D self-attn → FFN`  
+**Order=`code`（SegDINO3D 开源实现）**：`3D cross-attn → 3D self-attn → DACA‑2D → FFN`
 
-并强制防 NaN（对齐 SegDINO3D 的“追加 dummy query”做法）：
-- 若某个 3D query 对所有 2D query 都 mask 掉：追加一个 dummy 2D query（全 1 向量）+ 对应 mask 放开一列，保证 attention 有路可走。
+> 校准说明：SegDINO3D 代码在 `SegDINO3D/segdino3d/models/decoder/instance_seg_3d_decoder.py` 中实际为 `cross → self → DACA → ffn`，但论文文字描述更接近 `cross → DACA → self → ffn`。V2 在 AutoSeg3D 中两种顺序都保留，**用相同配置/子集跑消融**，以数据裁决。
+
+#### 先对齐 AutoSeg3D 的真实执行顺序（避免“论文顺序”写对但代码插错）
+
+AutoSeg3D 当前的 `ScanNetMixQueryDecoder.forward_iter_pred()` 内，每个 transformer layer 的固定顺序是：
+
+- `3D cross-attn` → `3D self-attn` → `FFN` → `_forward_head`（更新 `attn_mask` 给下一层用）
+
+因此 V2 里 `order` 的含义要明确落到“插入点”：
+
+- `order="paper"`：把 DACA‑2D 插在 **cross-attn 之后、self-attn 之前**
+- `order="code"`：把 DACA‑2D 插在 **self-attn 之后、FFN 之前**（与 SegDINO3D 开源实现一致）
+
+这两种插入点都只改变 query 表示，不会改变现有 `_forward_head` 产出的 mask 维度；因此适合作为纯顺序消融。
+
+#### distance-aware mask 的“正确做法”（关键校准点）
+
+SegDINO3D 的 DACA‑2D mask 不是简单的 `dist<thr`，而是利用“当前 3D query 的空间支持区域”（由 `attn_mask` 指向的 superpoints）去选择可见的 2D queries：
+
+- 已有 `attn_mask_sp`: `[Nq3d, Nsp]`（bool，True=禁止 attend；这是你们每层由 `pred_mask` 产生的 mask-attn）
+- 先构造 superpoint 的 3D 位置 `sp_pos`（AutoSeg3D 可以在 decoder 内用点坐标与 sp_id 计算）：
+  - `xyz = p_feats[:, :3]`（点的世界坐标；AutoSeg3D 的 `p_feats` 本身是 `torch.cat([xyz, feat], dim=-1)`）
+  - `sp_id = super_points[0]`（点到 superpoint 的映射）
+  - `sp_pos = scatter_mean(xyz, sp_id, dim=0)` → `[Nsp, 3]`
+- 对 2D object query 的 3D center（`query2d_pos: [Nq2d, 3]`）计算距离：
+  - `dist = cdist(sp_pos, query2d_pos, p=1)` → `[Nsp, Nq2d]`
+- 把“3D query 可 attend 的 superpoints”映射成“3D query 可 attend 的 2D queries”：
+  - `reach = (~attn_mask_sp).float() @ (dist < thr).float()` → `[Nq3d, Nq2d]`
+  - `daca_attn_mask = (reach == 0)`（bool，True=禁止 attend）
+
+这一步能显著降低“mask 全开/全关”的不稳定性：每个 3D query 只会去 attend 与其当前 spatial support 接近的 2D queries。
+
+#### 重要限制（必须在实现与配置里显式控制）
+
+上述公式要求 `attn_mask` 的 key 维度是 superpoints（`Nsp`）。在 AutoSeg3D 的默认 stage2 配置里：
+- `mask_pred_mode=["SP","SP","P","P"]`
+因此 V2 **明确只在 SP 域层插入 DACA‑2D**，不在 P 域注入（避免维度不一致与额外映射带来的工程风险）：
+
+- `inject_domain="sp"`（固定）
+- `inject_layers="auto_sp"`（推荐）：实现上按当前层 `mask_pred_mode[i]=="SP"` 自动启用（对应 i=0,1）；也可显式指定 `[0,1]`。
+
+> 备注：若未来要在 P 域层也注入，需要额外把点域 `attn_mask` 映射回 SP 域或改用 query positional state；这不属于 V2 范围。
+
+#### 防 NaN 的 dummy query（与 SegDINO3D 对齐）
+
+对齐 SegDINO3D 的策略：为避免出现某个 3D query 对所有 2D queries 都被 mask（导致 attention 数值不稳定），追加一个 dummy 2D query：
+- `query2d_feats <- cat([query2d_feats, ones(1,256)], dim=0)`
+- `daca_attn_mask <- cat([daca_attn_mask, zeros(Nq3d,1)], dim=-1)`（放开最后一列）
 
 诊断（每帧）记录：
 - `mask_open_ratio`（mask 为 False 的比例，或每个 query 可见 2D query 数分位数）
