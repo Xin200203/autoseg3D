@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import os
 import json
-from typing import Optional, Sequence, Dict
+from typing import Optional, Sequence, Dict, List
 from mmengine.logging import MMLogger
 
 from mmdet3d.evaluation.metrics import SegMetric
@@ -110,6 +110,33 @@ class UnifiedSegMetric(SegMetric):
                         vals.append(float(cur))
             return np.asarray(vals, dtype=np.float32)
 
+        def _collect_str(path: str) -> List[str]:
+            keys = path.split(".")
+            vals: List[str] = []
+            for s in monitors:
+                for fr in s.get("frames", []) if isinstance(s.get("frames", None), list) else []:
+                    cur = fr
+                    ok = True
+                    for k in keys:
+                        if isinstance(cur, dict):
+                            if k in cur:
+                                cur = cur[k]
+                                continue
+                            ok = False
+                            break
+                        if isinstance(cur, list) and k.isdigit():
+                            idx = int(k)
+                            if 0 <= idx < len(cur):
+                                cur = cur[idx]
+                                continue
+                            ok = False
+                            break
+                        ok = False
+                        break
+                    if ok and isinstance(cur, str):
+                        vals.append(cur)
+            return vals
+
         def _collect_scene(path: str) -> np.ndarray:
             keys = path.split(".")
             vals = []
@@ -170,6 +197,16 @@ class UnifiedSegMetric(SegMetric):
         assoc_track_after_mean_scene = _collect_scene("scene_assoc_summary.track_after_mean")
         inflation_scene = _collect_scene("scene_assoc_summary.inflation")
 
+        gdino_valid = _collect("gdino.valid_ratio")
+        gdino_pose = _collect_str("gdino.pose_mode")
+        gdino_skip = _collect_str("gdino.skipped")
+        pose_counts = {}
+        for m in gdino_pose:
+            pose_counts[m] = int(pose_counts.get(m, 0)) + 1
+        skip_counts = {}
+        for m in gdino_skip:
+            skip_counts[m] = int(skip_counts.get(m, 0)) + 1
+
         return {
             "counts": {
                 "scenes": int(len(monitors)),
@@ -189,6 +226,11 @@ class UnifiedSegMetric(SegMetric):
             },
             "sp_merge": {
                 "merge_drop": _pack(sp_merge_drop),
+            },
+            "gdino": {
+                "valid_ratio": _pack(gdino_valid),
+                "pose_mode_counts": pose_counts,
+                "skipped_counts": skip_counts,
             },
             "scene_gt_dup": {
                 "n_gt": _pack(scene_ngt),

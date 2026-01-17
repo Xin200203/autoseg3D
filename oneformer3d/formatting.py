@@ -170,7 +170,10 @@ class Pack3DDetInputs_(Pack3DDetInputs):
 class Pack3DDetInputs_Online(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_paths']
+    # NOTE: `cam_info` / `poses` / `img_paths` are python objects (lists/dicts)
+    # and should NOT be converted by `to_tensor`. Keep them in img_metas/inputs
+    # for downstream 2D-3D alignment diagnostics.
+    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_paths', 'poses', 'cam_info']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',
@@ -276,6 +279,9 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
         ] + self.added_keys:
             if key not in results:
                 continue
+            # Keep python-object metadata as-is (do not tensorize).
+            if key in ('cam_info', 'poses', 'img_paths'):
+                continue
             if isinstance(results[key], list):
                 results[key] = [to_tensor(res) for res in results[key]]
             else:
@@ -304,6 +310,14 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
         for key in self.meta_keys:
             if key in results:
                 img_metas[key] = results[key]
+        # Pass through cam_info for 2D-3D projection alignment diagnostics.
+        if 'cam_info' in results:
+            img_metas['cam_info'] = results['cam_info']
+        # Keep raw img_paths/poses in metainfo when present (useful for 2D backbones).
+        if 'img_paths' in results:
+            img_metas['img_paths'] = results['img_paths']
+        if 'poses' in results:
+            img_metas['poses'] = results['poses']
         img_metas['lidar_idx'] = results['lidar_idx']
         data_sample.img_metas = img_metas
         # data_sample.set_metainfo(img_metas)

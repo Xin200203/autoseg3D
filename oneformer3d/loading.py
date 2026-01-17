@@ -1,8 +1,10 @@
 # Adapted from mmdet3d/datasets/transforms/loading.py
 import mmengine
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 import os, pdb, json
+
+import torch
 
 from mmdet3d.datasets.transforms import LoadAnnotations3D
 from mmdet3d.datasets.transforms.loading import get
@@ -166,6 +168,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
                  with_rec=False,
                  cat_rec=False,
                  use_FF=False,
+                 keep_img_paths_poses: bool = False,
                  backend_args: Optional[dict] = None,
                  dataset_type = 'scannet200') -> None:
         self.shift_height = shift_height
@@ -193,6 +196,10 @@ class LoadAdjacentDataFromFile(BaseTransform):
         self.with_rec = with_rec
         self.cat_rec = cat_rec
         self.use_FF = use_FF
+        # When True, keep `img_paths`/`poses` from infos for downstream online
+        # projection/2D-backbone diagnostics without loading images in dataloader.
+        # Default False to preserve original behavior.
+        self.keep_img_paths_poses = bool(keep_img_paths_poses)
         self.backend_args = backend_args
         self.dataset_type = dataset_type
         
@@ -364,7 +371,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
         pts_instance_mask_paths = results['pts_instance_mask_paths']
         pts_semantic_mask_paths = results['pts_semantic_mask_paths']
         sp_pts_mask_paths = results['super_pts_paths']
-        if self.use_FF:
+        if self.use_FF or self.keep_img_paths_poses:
             img_file_paths = results['img_paths']
             poses = results['poses']
         else:
@@ -381,7 +388,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
             pts_instance_mask_paths = [pts_instance_mask_paths[idx] for idx in keep_view_idx]
             pts_semantic_mask_paths = [pts_semantic_mask_paths[idx] for idx in keep_view_idx]
             sp_pts_mask_paths = [sp_pts_mask_paths[idx] for idx in keep_view_idx]
-            if self.use_FF: # False
+            if self.use_FF or self.keep_img_paths_poses: # False by default
                 img_file_paths = [img_file_paths[idx] for idx in keep_view_idx]
                 poses = [poses[idx] for idx in keep_view_idx]
 
@@ -395,7 +402,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
             results['pts_instance_mask_paths'] = pts_instance_mask_paths
             results['pts_semantic_mask_paths'] = pts_semantic_mask_paths
             results['super_pts_paths'] = sp_pts_mask_paths
-            if self.use_FF:
+            if self.use_FF or self.keep_img_paths_poses:
                 img_file_paths = [img_file_paths[idx] for idx in choose_seq]
                 results['img_paths'] = img_file_paths
                 poses = [poses[idx] for idx in choose_seq]
@@ -475,6 +482,12 @@ class LoadAdjacentDataFromFile(BaseTransform):
             results['poses'] = poses
             if self.dataset_type == 'scenenn':  
                 results['poses'] = [(self.transform_matrix @ pose) for pose in poses]
+        elif self.keep_img_paths_poses:
+            # Keep metadata for downstream online projection / 2D backbone.
+            results['img_paths'] = img_file_paths
+            results['poses'] = poses
+            if self.dataset_type == 'scenenn':
+                results['poses'] = [(self.transform_matrix @ pose) for pose in poses]
         results['num_frames'] = len(pts_file_paths) if self.num_frames == -1 else self.num_frames
         results['num_sample'] = self.num_sample
         return results
@@ -490,6 +503,286 @@ class LoadAdjacentDataFromFile(BaseTransform):
         repr_str += f'norm_intensity={self.norm_intensity})'
         repr_str += f'norm_elongation={self.norm_elongation})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class NormalizeCamInfo(BaseTransform):
+    """Normalize `results['cam_info']` to a stable list[dict] with tensor fields.
+
+    Motivation:
+    - MV data carries per-frame cam intrinsics/poses.
+    - mmengine's default_collate can produce nested list-of-tensor structures
+      when cam_info is a list. We avoid ambiguity by ensuring each frame meta
+      is a plain dict and important fields are tensors with fixed shapes.
+    """
+
+    def __init__(self, *, strict: bool = False) -> None:
+        super().__init__()
+        self.strict = bool(strict)
+
+    @staticmethod
+    def _to_tensor_1d(x, *, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x.reshape(-1).to(dtype=dtype)
+        else:
+            t = torch.tensor(list(x), dtype=dtype).reshape(-1)
+        return t
+
+    @staticmethod
+    def _to_tensor_2d(x, *, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x.to(dtype=dtype)
+        else:
+            t = torch.tensor(x, dtype=dtype)
+        return t.reshape(4, 4)
+
+    def _normalize_single(self, cam_meta: dict) -> dict:
+        intr = cam_meta.get('intrinsics', None)
+        if intr is not None:
+            intr_t = self._to_tensor_1d(intr, dtype=torch.float32)
+            if self.strict and intr_t.numel() != 4:
+                raise RuntimeError(f"[NormalizeCamInfo] invalid intrinsics shape: {intr_t.shape}")
+            cam_meta['intrinsics'] = intr_t[:4].to(torch.float32)
+
+        # Prefer img_size_gdino; fall back to img_size_dino if provided.
+        img_size = cam_meta.get('img_size_gdino', None)
+        if img_size is None:
+            img_size = cam_meta.get('img_size_dino', None)
+        if img_size is not None:
+            img_t = self._to_tensor_1d(img_size, dtype=torch.int64)
+            if self.strict and img_t.numel() != 2:
+                raise RuntimeError(f"[NormalizeCamInfo] invalid img_size shape: {img_t.shape}")
+            cam_meta['img_size_gdino'] = img_t[:2].to(torch.int64)
+            cam_meta.pop('img_size_dino', None)
+
+        for k in ('pose', 'extrinsics', 'axis_align_matrix'):
+            mat = cam_meta.get(k, None)
+            if mat is None:
+                continue
+            mat_t = self._to_tensor_2d(mat, dtype=torch.float32)
+            if self.strict and mat_t.shape != (4, 4):
+                raise RuntimeError(f"[NormalizeCamInfo] invalid {k} shape: {mat_t.shape}")
+            cam_meta[k] = mat_t
+
+        if 'img_valid' in cam_meta:
+            cam_meta['img_valid'] = bool(cam_meta['img_valid'])
+
+        return cam_meta
+
+    def transform(self, results: dict) -> dict:
+        cam_info = results.get('cam_info', None)
+        if cam_info is None:
+            return results
+
+        if isinstance(cam_info, dict):
+            cam_list = [cam_info]
+        elif isinstance(cam_info, list):
+            cam_list = [m for m in cam_info if isinstance(m, dict)]
+        else:
+            if self.strict:
+                raise RuntimeError(f"[NormalizeCamInfo] unexpected cam_info type: {type(cam_info)}")
+            return results
+
+        out = []
+        for m in cam_list:
+            out.append(self._normalize_single(dict(m)))
+        results['cam_info'] = out
+        return results
+
+
+@TRANSFORMS.register_module()
+class BuildCamInfoFromPoses(BaseTransform):
+    """Build per-frame cam_info from `poses` and fixed intrinsics (ScanNet-style).
+
+    This is mainly for MV pipelines where infos already include `poses`/`img_paths`
+    but the training loop expects unified `cam_info` metadata for 2D-3D projection.
+    """
+
+    def __init__(self, dataset_type: str = 'scannet200') -> None:
+        super().__init__()
+        self.dataset_type = str(dataset_type)
+
+    def _get_intrinsics(self) -> List[float]:
+        if self.dataset_type in ['scannet', 'scannet200']:
+            return [577.870605, 577.870605, 319.5, 239.5]
+        if self.dataset_type == 'scenenn':
+            return [544.47329, 544.47329, 320.0, 240.0]
+        return [577.870605, 577.870605, 319.5, 239.5]
+
+    @staticmethod
+    def _infer_hw_from_img(img) -> Tuple[int, int]:
+        if img is None:
+            return 480, 640
+        if torch.is_tensor(img):
+            if img.dim() == 3:
+                # CHW
+                if img.shape[0] in (1, 3, 4):
+                    return int(img.shape[1]), int(img.shape[2])
+                # HWC
+                if img.shape[-1] in (1, 3, 4):
+                    return int(img.shape[0]), int(img.shape[1])
+            return int(img.shape[-2]), int(img.shape[-1])
+        try:
+            import numpy as np
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3:
+                    if img.shape[-1] in (1, 3, 4):
+                        return int(img.shape[0]), int(img.shape[1])
+                    if img.shape[0] in (1, 3, 4):
+                        return int(img.shape[1]), int(img.shape[2])
+                if img.ndim == 2:
+                    return int(img.shape[0]), int(img.shape[1])
+        except Exception:
+            pass
+        return 480, 640
+
+    def transform(self, results: dict) -> dict:
+        if results.get('cam_info', None) is not None:
+            return results
+        poses = results.get('poses', None)
+        if poses is None:
+            return results
+
+        poses_list = poses if isinstance(poses, list) else [poses]
+        imgs = results.get('img', None)
+        if isinstance(imgs, list):
+            imgs_list = imgs
+        elif imgs is None:
+            imgs_list = [None] * len(poses_list)
+        else:
+            imgs_list = [imgs] * len(poses_list)
+        if len(imgs_list) < len(poses_list):
+            imgs_list = imgs_list + [imgs_list[-1]] * (len(poses_list) - len(imgs_list))
+
+        intr = self._get_intrinsics()
+        cam_info = []
+        for idx, pose in enumerate(poses_list):
+            cam = {}
+            cam['intrinsics'] = torch.tensor(intr, dtype=torch.float32)
+            h0, w0 = self._infer_hw_from_img(imgs_list[idx] if idx < len(imgs_list) else None)
+            cam['img_size_gdino'] = torch.tensor([int(h0), int(w0)], dtype=torch.int64)
+            if pose is not None:
+                pose_t = torch.as_tensor(pose, dtype=torch.float32).reshape(4, 4)
+                cam['pose'] = pose_t
+                cam['extrinsics'] = pose_t
+            cam['img_valid'] = bool(imgs_list[idx] is not None)
+            cam_info.append(cam)
+        results['cam_info'] = cam_info
+        return results
+
+
+@TRANSFORMS.register_module()
+class ResizeForGDINO(BaseTransform):
+    """Resize image to a fixed size for GroundingDINO and update intrinsics.
+
+    Notes:
+    - First version uses fixed (H,W) resize (no keep_ratio/pad/crop).
+    - It updates intrinsics purely by scale; half-pixel alignment (+0.5/-0.5)
+      is applied later when scaling from image coords to feature-map coords.
+    """
+
+    def __init__(self, target_size: Tuple[int, int] = (420, 560)) -> None:
+        super().__init__()
+        self.target_h, self.target_w = int(target_size[0]), int(target_size[1])
+
+    @staticmethod
+    def _infer_hw(img) -> Tuple[int, int]:
+        if img is None:
+            return 480, 640
+        if torch.is_tensor(img):
+            if img.dim() == 3 and img.shape[0] in (1, 3, 4):
+                return int(img.shape[1]), int(img.shape[2])
+            return int(img.shape[-2]), int(img.shape[-1])
+        try:
+            import numpy as np
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3 and img.shape[-1] in (1, 3, 4):
+                    return int(img.shape[0]), int(img.shape[1])
+                if img.ndim == 3 and img.shape[0] in (1, 3, 4):
+                    return int(img.shape[1]), int(img.shape[2])
+                if img.ndim == 2:
+                    return int(img.shape[0]), int(img.shape[1])
+        except Exception:
+            pass
+        return 480, 640
+
+    @staticmethod
+    def _resize_img_tensor(img: torch.Tensor, *, h1: int, w1: int) -> torch.Tensor:
+        if img.dim() == 3:
+            if img.shape[0] not in (1, 3, 4) and img.shape[-1] in (1, 3, 4):
+                img = img.permute(2, 0, 1).contiguous()
+        elif img.dim() == 4:
+            # (T,C,H,W) -> resize per frame with interpolate
+            pass
+        return torch.nn.functional.interpolate(
+            img.unsqueeze(0), size=(h1, w1), mode='bilinear', align_corners=False
+        ).squeeze(0)
+
+    def _update_intrinsics(self, cam_meta: dict, *, h0: int, w0: int, h1: int, w1: int) -> None:
+        intr = cam_meta.get('intrinsics', None)
+        if intr is None:
+            cam_meta['img_size_gdino'] = torch.tensor([int(h1), int(w1)], dtype=torch.int64)
+            return
+        if torch.is_tensor(intr):
+            intr_t = intr.reshape(-1).to(torch.float32)
+            fx, fy, cx, cy = [float(x) for x in intr_t[:4]]
+        else:
+            fx, fy, cx, cy = [float(x) for x in list(intr)[:4]]
+        scale_w = float(w1) / max(float(w0), 1.0)
+        scale_h = float(h1) / max(float(h0), 1.0)
+        cam_meta['intrinsics'] = torch.tensor(
+            [fx * scale_w, fy * scale_h, cx * scale_w, cy * scale_h],
+            dtype=torch.float32,
+        )
+        cam_meta['img_size_gdino'] = torch.tensor([int(h1), int(w1)], dtype=torch.int64)
+
+    def transform(self, results: dict) -> dict:
+        imgs = results.get('img', None)
+        cam_info = results.get('cam_info', None)
+
+        # Normalize cam_info to list so update code is consistent.
+        cam_list = None
+        if isinstance(cam_info, dict):
+            cam_list = [cam_info]
+        elif isinstance(cam_info, list):
+            cam_list = cam_info
+
+        # Resize images if present (optional for diagnostics).
+        if isinstance(imgs, list):
+            out_imgs = []
+            for i, im in enumerate(imgs):
+                if torch.is_tensor(im):
+                    h0, w0 = self._infer_hw(im)
+                    out_imgs.append(self._resize_img_tensor(im.float(), h1=self.target_h, w1=self.target_w))
+                else:
+                    # keep as-is (numpy); resizing can be done online in model
+                    out_imgs.append(im)
+                    h0, w0 = self._infer_hw(im)
+                if cam_list is not None and i < len(cam_list) and isinstance(cam_list[i], dict):
+                    self._update_intrinsics(cam_list[i], h0=h0, w0=w0, h1=self.target_h, w1=self.target_w)
+            results['img'] = out_imgs
+        elif imgs is not None:
+            h0, w0 = self._infer_hw(imgs)
+            if torch.is_tensor(imgs):
+                results['img'] = self._resize_img_tensor(imgs.float(), h1=self.target_h, w1=self.target_w)
+            if cam_list is not None and len(cam_list) > 0 and isinstance(cam_list[0], dict):
+                self._update_intrinsics(cam_list[0], h0=h0, w0=w0, h1=self.target_h, w1=self.target_w)
+        else:
+            # No images loaded; update cam_info sizes only.
+            if cam_list is not None:
+                for cam in cam_list:
+                    if not isinstance(cam, dict):
+                        continue
+                    h0, w0 = self._infer_hw(None)
+                    # Prefer existing img_size_gdino as h0,w0 if present.
+                    hw = cam.get('img_size_gdino', None)
+                    if torch.is_tensor(hw) and hw.numel() == 2:
+                        h0, w0 = int(hw.reshape(-1)[0].item()), int(hw.reshape(-1)[1].item())
+                    self._update_intrinsics(cam, h0=h0, w0=w0, h1=self.target_h, w1=self.target_w)
+
+        if cam_list is not None:
+            results['cam_info'] = cam_list
+        return results
 
 @TRANSFORMS.register_module()
 class LoadPointsFromFile_(BaseTransform):

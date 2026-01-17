@@ -300,7 +300,17 @@ test_pipeline = [
         with_mask_3d=True,
         with_seg_3d=True,
         with_sp_mask_3d=True,
-        with_rec=True),
+        with_rec=True,
+        # Keep (img_paths, poses) for online 2D backbones/diagnostics.
+        keep_img_paths_poses=True,
+        use_FF=False,
+        dataset_type='scannet200'),
+    # Build per-frame cam_info (intrinsics/pose) for alignment-safe projection.
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
+    # Fixed-size resize metadata for GroundingDINO (actual image resize is done online in model).
+    dict(type='ResizeForGDINO', target_size=(420, 560)),
+    # Normalize cam_info to stable per-frame list[dict] with tensor fields.
+    dict(type='NormalizeCamInfo', strict=True),
     dict(type='SwapChairAndFloorWithRec'),
     dict(type='PointSegClassMappingWithRec'),
     dict(
