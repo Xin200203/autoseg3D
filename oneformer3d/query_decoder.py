@@ -611,31 +611,37 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         metric = str(mask_cfg.get("metric", "l1")).lower()
         p = 1 if metric == "l1" else 2
 
-        daca_masks, q2d_list = [], []
+        outputs = []
         for b in range(len(queries)):
             attn_b = attn_mask[b]
             sp_pos = sp_pos_list[b]
             q2d = query2d_feats[b]
             q2d_pos = query2d_pos[b]
             if not torch.is_tensor(attn_b) or not torch.is_tensor(sp_pos):
-                return queries
+                outputs.append(queries[b])
+                continue
             if not torch.is_tensor(q2d) or not torch.is_tensor(q2d_pos):
-                return queries
-            if attn_b.numel() == 0 or sp_pos.numel() == 0 or q2d_pos.numel() == 0:
-                return queries
+                outputs.append(queries[b])
+                continue
+            if attn_b.numel() == 0 or sp_pos.numel() == 0 or q2d.numel() == 0 or q2d_pos.numel() == 0:
+                outputs.append(queries[b])
+                continue
             # Ensure SP mask dimension matches sp_pos
             if attn_b.shape[1] != sp_pos.shape[0]:
-                return queries
+                outputs.append(queries[b])
+                continue
+
             dist = torch.cdist(sp_pos, q2d_pos, p=p)
             reach = (~attn_b).float() @ (dist < thr).float()
             daca_mask = (reach == 0)
             # Append dummy query to avoid empty attention rows (SegDINO3D style)
             q2d = torch.cat([q2d, q2d.new_ones(1, q2d.shape[1])], dim=0)
             daca_mask = torch.cat([daca_mask, daca_mask.new_zeros(daca_mask.shape[0], 1)], dim=1)
-            q2d_list.append(q2d)
-            daca_masks.append(daca_mask)
 
-        return self.dino_query_cross_attn_layers[layer_idx](q2d_list, queries, daca_masks)
+            out_b = self.dino_query_cross_attn_layers[layer_idx]([q2d], [queries[b]], [daca_mask])[0]
+            outputs.append(out_b)
+
+        return outputs
     
     def reset_query_memory2(self):
         """Reset the detector.
@@ -703,7 +709,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
 
     def forward_iter_pred(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
                           inst_dict=None, track_instances=None, use_one2many=False,
-                          query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None):
+                          query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None,
+                          sp_pos_list_override=None):
         """Iterative forward pass.
         
         Args:
@@ -764,12 +771,15 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         sp_pos_list = None
         if use_daca2d:
             try:
-                sp_pos_list = []
-                for pf, sp in zip(p_feats, super_points[0]):
-                    xyz = pf[:, :3]
-                    sp_id = sp.to(xyz.device)
-                    sp_pos = scatter_mean(xyz, sp_id, dim=0)
-                    sp_pos_list.append(sp_pos)
+                if sp_pos_list_override is not None:
+                    sp_pos_list = sp_pos_list_override
+                else:
+                    sp_pos_list = []
+                    for pf, sp in zip(p_feats, super_points[0]):
+                        xyz = pf[:, :3]
+                        sp_id = sp.to(xyz.device)
+                        sp_pos = scatter_mean(xyz, sp_id, dim=0)
+                        sp_pos_list.append(sp_pos)
             except Exception:
                 sp_pos_list = None
                 use_daca2d = False
@@ -948,7 +958,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
     
     def forward(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
                 inst_dict=False, track_instances=None, use_one2many=False,
-                query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None):
+                query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None,
+                sp_pos_list_override=None):
         """Forward pass.
         
         Args:
@@ -966,7 +977,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                 use_temporal_loss=use_temporal_loss, inst_dict=inst_dict,
                 track_instances=track_instances, use_one2many=use_one2many,
                 query2d_feats=query2d_feats, query2d_pos=query2d_pos,
-                gdino_daca2d_cfg=gdino_daca2d_cfg)
+                gdino_daca2d_cfg=gdino_daca2d_cfg,
+                sp_pos_list_override=sp_pos_list_override)
         else:
             raise NotImplementedError("No simple forward!!!")
 

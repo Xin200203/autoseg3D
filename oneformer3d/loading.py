@@ -682,6 +682,31 @@ class BuildCamInfoFromPoses(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class SavePointsForProjection(BaseTransform):
+    """Cache a copy of points before 3D augmentations for 2D-3D projection."""
+
+    def transform(self, results: dict) -> dict:
+        pts = results.get('points', None)
+        if pts is None:
+            return results
+        try:
+            from mmdet3d.structures.points import BasePoints
+            if isinstance(pts, BasePoints):
+                results['points_raw'] = pts.tensor.clone()
+                return results
+        except Exception:
+            pass
+        if torch.is_tensor(pts):
+            results['points_raw'] = pts.clone()
+        else:
+            try:
+                results['points_raw'] = torch.as_tensor(pts).clone()
+            except Exception:
+                pass
+        return results
+
+
+@TRANSFORMS.register_module()
 class ResizeForGDINO(BaseTransform):
     """Resize image to a fixed size for GroundingDINO and update intrinsics.
 
@@ -792,6 +817,77 @@ class ResizeForGDINO(BaseTransform):
 
         if cam_list is not None:
             results['cam_info'] = cam_list
+        return results
+
+@TRANSFORMS.register_module()
+class PrepareSVForOnline(BaseTransform):
+    """Adapt ScanNet200 SV (single-frame) infos to Online model input format.
+
+    SV infos provide:
+      - img_path (str)
+      - pose (4x4) and axis_align_matrix (4x4)
+    Online model expects:
+      - img_paths: list[str] (length T)
+      - poses: list[4x4] (length T)
+      - num_frames, num_sample for temporal reshape in Pack3DDetInputs_Online
+
+    This transform is intended for T=1. It is a pure metadata adapter and does
+    not load images.
+    """
+
+    def __init__(self, *, apply_axis_align: bool = True) -> None:
+        super().__init__()
+        self.apply_axis_align = bool(apply_axis_align)
+
+    @staticmethod
+    def _infer_num_sample(points) -> int:
+        try:
+            from mmdet3d.structures.points import BasePoints
+            if isinstance(points, BasePoints):
+                return int(points.tensor.shape[0])
+        except Exception:
+            pass
+        if torch.is_tensor(points):
+            return int(points.shape[0])
+        try:
+            return int(len(points))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _mat44(x) -> np.ndarray:
+        if x is None:
+            return np.eye(4, dtype=np.float32)
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy().reshape(4, 4).astype(np.float32)
+        if isinstance(x, np.ndarray):
+            return x.reshape(4, 4).astype(np.float32)
+        return np.asarray(x, dtype=np.float32).reshape(4, 4)
+
+    def transform(self, results: dict) -> dict:
+        # T=1 by definition for SV.
+        results.setdefault('num_frames', 1)
+
+        if 'num_sample' not in results:
+            n = self._infer_num_sample(results.get('points', None))
+            if n > 0:
+                results['num_sample'] = n
+
+        if 'img_paths' not in results and 'img_path' in results:
+            results['img_paths'] = [results['img_path']]
+
+        if 'poses' not in results and 'pose' in results:
+            pose = results.get('pose', None)
+            if self.apply_axis_align and 'axis_align_matrix' in results:
+                try:
+                    axis_align = self._mat44(results.get('axis_align_matrix', None))
+                    pose_m = self._mat44(pose)
+                    pose = (axis_align @ pose_m).astype(np.float32)
+                except Exception:
+                    # Fall back to raw pose.
+                    pose = self._mat44(pose)
+            results['poses'] = [pose]
+
         return results
 
 @TRANSFORMS.register_module()

@@ -1,5 +1,6 @@
 # Adapted from mmdet3d/datasets/transforms/formating.py
 import numpy as np
+import torch
 from mmengine.structures import InstanceData
 
 from mmdet3d.datasets.transforms import Pack3DDetInputs
@@ -173,7 +174,7 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
     # NOTE: `cam_info` / `poses` / `img_paths` are python objects (lists/dicts)
     # and should NOT be converted by `to_tensor`. Keep them in img_metas/inputs
     # for downstream 2D-3D alignment diagnostics.
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_paths', 'poses', 'cam_info']
+    INPUTS_KEYS = ['points', 'points_raw', 'img', 'elastic_coords', 'img_paths', 'poses', 'cam_info']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',
@@ -218,6 +219,13 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
             if isinstance(results['points'], BasePoints):
                 results['points'] = results['points'].tensor
             results['points'] = results['points'].reshape(results['num_frames'], results['num_sample'], -1)
+        if 'points_raw' in results:
+            if isinstance(results['points_raw'], BasePoints):
+                results['points_raw'] = results['points_raw'].tensor
+            if torch.is_tensor(results['points_raw']):
+                results['points_raw'] = results['points_raw'].reshape(
+                    results['num_frames'], results['num_sample'], -1
+                )
 
         if 'poses' in results:
             depth2img = []
@@ -318,7 +326,28 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
             img_metas['img_paths'] = results['img_paths']
         if 'poses' in results:
             img_metas['poses'] = results['poses']
-        img_metas['lidar_idx'] = results['lidar_idx']
+        # Preserve 3D augmentation metadata for reverse projection (apply_3d_transformation).
+        for k in [
+            'pcd_rotation',
+            'pcd_scale_factor',
+            'pcd_trans',
+            'pcd_horizontal_flip',
+            'pcd_vertical_flip',
+            'transformation_3d_flow',
+        ]:
+            if k in results:
+                img_metas[k] = results[k]
+        # `lidar_idx` is not guaranteed to exist for all dataset variants (e.g. SV infos).
+        # Fallback to `sample_idx` or lidar_path for stable identification.
+        if 'lidar_idx' in results:
+            img_metas['lidar_idx'] = results['lidar_idx']
+        elif 'sample_idx' in results:
+            img_metas['lidar_idx'] = results['sample_idx']
+        else:
+            try:
+                img_metas['lidar_idx'] = results.get('lidar_points', {}).get('lidar_path', '')
+            except Exception:
+                img_metas['lidar_idx'] = ''
         data_sample.img_metas = img_metas
         # data_sample.set_metainfo(img_metas)
 
@@ -355,6 +384,126 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
         packed_results['data_samples'] = data_sample
         packed_results['inputs'] = inputs
         return packed_results
+
+
+@TRANSFORMS.register_module()
+class Pack3DDetInputs_SVOnline(Pack3DDetInputs):
+    """Pack SV (single-frame) samples with extra 2D-3D alignment metadata.
+
+    Differences vs `Pack3DDetInputs_Online`:
+    - Keeps `points` shape as (N, C) (no temporal reshape). This is required by
+      offline SV models (e.g. `ScanNet200MixFormer3D`).
+    - Passes through python-object metadata (`cam_info`, `poses`, `img_paths`)
+      into `data_sample.img_metas` for downstream GDINO projection.
+    - Adds optional `points_raw` to inputs for "raw projection + aug write-in"
+      usage (point_fusion uses raw projection; decoder uses augmented xyz).
+    """
+
+    INPUTS_KEYS = ['points', 'points_raw', 'elastic_coords', 'img_paths', 'poses', 'cam_info']
+    SEG_KEYS = [
+        'gt_seg_map',
+        'pts_instance_mask',
+        'pts_semantic_mask',
+        'gt_semantic_seg',
+        'sp_pts_mask',
+    ]
+    INSTANCEDATA_3D_KEYS = [
+        'gt_bboxes_3d', 'gt_labels_3d', 'attr_labels', 'depths', 'centers_2d',
+        'gt_sp_masks'
+    ]
+
+    def __init__(self, keys, dataset_type='scannet200'):
+        super().__init__(keys)
+        self.dataset_type = dataset_type
+
+    def pack_single_results(self, results: dict) -> dict:
+        # Format points to tensor (keep 2D shape for SV models).
+        if 'points' in results:
+            if isinstance(results['points'], BasePoints):
+                results['points'] = results['points'].tensor
+        if 'points_raw' in results:
+            if isinstance(results['points_raw'], BasePoints):
+                results['points_raw'] = results['points_raw'].tensor
+
+        # Only tensorize known numeric keys; keep metadata python objects as-is.
+        for key in [
+                'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
+                'gt_bboxes_labels', 'attr_labels', 'pts_instance_mask',
+                'pts_semantic_mask', 'sp_pts_mask', 'gt_sp_masks',
+                'elastic_coords', 'centers_2d', 'depths', 'gt_labels_3d'
+        ]:
+            if key not in results:
+                continue
+            if isinstance(results[key], list):
+                results[key] = [to_tensor(res) for res in results[key]]
+            else:
+                results[key] = to_tensor(results[key])
+
+        if 'gt_bboxes_3d' in results:
+            if not isinstance(results['gt_bboxes_3d'], BaseInstance3DBoxes):
+                results['gt_bboxes_3d'] = to_tensor(results['gt_bboxes_3d'])
+
+        if 'gt_semantic_seg' in results:
+            results['gt_semantic_seg'] = to_tensor(results['gt_semantic_seg'][None])
+        if 'gt_seg_map' in results:
+            results['gt_seg_map'] = results['gt_seg_map'][None, ...]
+
+        data_sample = Det3DDataSample()
+        gt_instances_3d = InstanceData()
+        gt_instances = InstanceData()
+        gt_pts_seg = PointData()
+
+        img_metas = {}
+        for key in self.meta_keys:
+            if key in results:
+                img_metas[key] = results[key]
+        # Pass through 2D-3D alignment metadata (python objects).
+        for k in ('cam_info', 'img_paths', 'poses'):
+            if k in results:
+                img_metas[k] = results[k]
+        # Preserve 3D augmentation metadata for reverse projection.
+        for k in [
+            'pcd_rotation',
+            'pcd_scale_factor',
+            'pcd_trans',
+            'pcd_horizontal_flip',
+            'pcd_vertical_flip',
+            'transformation_3d_flow',
+        ]:
+            if k in results:
+                img_metas[k] = results[k]
+        data_sample.img_metas = img_metas
+        try:
+            data_sample.set_metainfo(img_metas)
+        except Exception:
+            pass
+
+        inputs = {}
+        for key in self.keys:
+            if key not in results:
+                continue
+            if key in self.INPUTS_KEYS:
+                inputs[key] = results[key]
+            elif key in self.INSTANCEDATA_3D_KEYS:
+                gt_instances_3d[self._remove_prefix(key)] = results[key]
+            elif key in self.INSTANCEDATA_2D_KEYS:
+                if key == 'gt_bboxes_labels':
+                    gt_instances['labels'] = results[key]
+                else:
+                    gt_instances[self._remove_prefix(key)] = results[key]
+            elif key in self.SEG_KEYS:
+                gt_pts_seg[self._remove_prefix(key)] = results[key]
+            else:
+                raise NotImplementedError(
+                    f'Please modify Pack3DDetInputs_SVOnline to put {key} to the correct field'
+                )
+
+        data_sample.gt_instances_3d = gt_instances_3d
+        data_sample.gt_instances = gt_instances
+        data_sample.gt_pts_seg = gt_pts_seg
+        data_sample.eval_ann_info = results.get('eval_ann_info', None)
+
+        return dict(data_samples=data_sample, inputs=inputs)
     
 
 def make_intrinsic(fx, fy, mx, my):

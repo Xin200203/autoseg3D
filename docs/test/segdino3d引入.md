@@ -6,6 +6,101 @@
 
 ---
 
+# -1. 本轮“校准结论”：我们到底要引入 SegDINO3D 的什么
+
+你当前的目标不是“在 AutoSeg3D 上堆一些 2D 特征试试”，而是**尽可能严格地把 SegDINO3D 的 2D×3D 联合机制迁移过来**。两者共同祖先都是 OneFormer3D，因此正确做法是：
+
+- **先对齐结构（结构对齐优先于调参）**：UNet early‑fusion（point‑level 2D→3D） + decoder object‑level DACA‑2D（2D object queries → 3D queries）
+- **再对齐坐标空间（这是最容易“看似启用但完全无效”的坑）**：DACA 距离门控必须与 decoder 的 3D 空间一致；投影 box/support 必须与相机几何一致
+- **最后对齐损失/匹配**：SegDINO3D 的 box center/size 监督并不是“数据集提供 bbox”，而是训练时从 GT mask+点坐标算出来的
+
+本文件后续把“已实现/未实现/需要修复”的颗粒度写到**函数/张量维度/空间约定**级别，避免“改了一堆但效果等价于没改”。
+
+---
+
+# -2. SegDINO3D vs AutoSeg3D：对照总览（到文件/张量级别）
+
+## -2.1 SegDINO3D 的关键工程点（你要迁移的“核心三件事”）
+
+1) **Point‑level early fusion（送进 MinkUNet）**  
+SegDINO3D 不是只做 decoder 注入，它把每个 3D 点对应的 2D feature（256d）拼到点云输入里：  
+- `in_channels = 256 + 3`（3D 的 RGB/颜色 3 通道 + 2D point feature 256 通道）  
+- backbone 输出 `out_channels=96`  
+代码参考：`SegDINO3D/configs/models/base_3d.py` 与 `SegDINO3D/segdino3d/models/backbone/minkunet.py`（cat RGB + points_2dfeats）
+
+2) **Object‑level DACA‑2D（2D object queries 注入 decoder）**  
+SegDINO3D 的 DACA‑2D 注入不是 ROI pooling，而是：  
+- 使用 2D foundation model 的 object queries embedding（`dinox_queries`，维度 256）  
+- 每个 2D query 还需要一个 3D anchor（`dinox_query_pos`，维度 3）  
+- DACA mask 用 `pos_wo_elastic (Nsp,3)` 与 `dinox_query_pos (Nq2d,3)` 做 `cdist`，再由 `attn_mask (Nq3d,Nsp)` 映射到 `Nq2d`  
+代码参考：`SegDINO3D/segdino3d/models/decoder/instance_seg_3d_decoder.py` 中 `add_dinox_query_ca/add_dinox_query_ca_mask`
+
+3) **Box center/size 监督不是“数据集 bbox”**  
+SegDINO3D 在训练时从 GT instance mask + 点坐标直接计算：  
+- `instance_centers (n_inst,3)`  
+- `instance_sizes (n_inst,3)`  
+并在 matcher/loss 里启用 CenterL1Cost、SizeL1Cost 与对应 L1 loss。  
+代码参考：`SegDINO3D/segdino3d/models/architecture/baseline3d.py:get_extra_instance_data()` 与 `SegDINO3D/segdino3d/models/loss/loss_3d.py`
+
+> 结论：如果只做 “GDINO backbone_only 的 srcs + ROI pooling” 或 “仅 point‑feature 拼接”，都无法完整复现 SegDINO3D 的收益路径；你要求的 V2 必须同时具备 early fusion + object‑level DACA‑2D 才符合论文/代码主线。
+
+## -2.2 AutoSeg3D 当前分支“已实现/部分实现/未实现”
+
+### 已实现（代码已存在，可复用）
+- `AutoSeg3D/oneformer3d/gdino_backbone.py`：`GroundingDINOBackbone` 支持 `backbone_only` 与 `full forward`，能输出 `srcs / hs_last / pred_boxes / pred_scores`
+- `AutoSeg3D/oneformer3d/loading.py`：存在 `ResizeForGDINO`、`NormalizeCamInfo`、`BuildCamInfoFromPoses`（严格规范化 cam_info 是对齐关键）
+- `AutoSeg3D/oneformer3d/mixformer3d.py`：  
+  - `_run_gdino_point_fusion_for_frame()`：对每帧投影采样 `srcs[level]` 形成 point‑wise 2D feature，并带 `valid_ratio` 监控  
+  - `_run_gdino_daca2d_for_frame()`：full forward 后构造 `query2d_feats/query2d_pos`（基于 box 内 support points 的 3D median）
+- `AutoSeg3D/oneformer3d/query_decoder.py`：  
+  - 已实现 “SP 域专用”的 DACA‑2D 注入 `_apply_daca2d()`  
+  - 支持 `order="paper"/"code"` 的顺序消融（见 `gdino_daca2d_cfg.order`）
+
+### 维度对照（帮助你快速排查“维度不一致导致无效注入”）
+
+以 SegDINO3D 的 base 配置为参照（`d_model=256, backbone out_channels=96`），两边在“decoder 主干维度”上是天然对齐的：
+
+- **2D object queries embedding**：`hs_last / dinox_queries` → `256d`
+- **decoder d_model**：`256`
+- **3D backbone 输出（送入 decoder 的 in_channels）**：`96`
+- **decoder input_proj**：`96 → 256`
+- **mask head（dot product）**：query(256) 与 mask_feats(256) 做相似度（两边都属于 OneFormer3D 系列常见实现）
+
+因此：V2 里 object‑level 的注入“理论上不需要额外投影层”，只要 `hs_last` 经过筛选后仍是 `[...,256]`，即可直接作为 2D query embedding 进入 decoder 的 cross‑attn。
+
+### 目前仍缺/仍存在偏差（这些会让 V2 训练“看似启用但无效”）
+- **训练路径未保证调用 object‑level DACA‑2D**：当前 DACA 的数据/开关主要挂在 `test_cfg.gdino_daca2d`，需要明确 `loss()`/训练 forward 是否也会构造并传入 `query2d_feats/query2d_pos`
+- **DACA 距离门控空间一致性未被“写死保证”**：SegDINO3D 明确用 `pos_wo_elastic`（非 elastic 的 SP 位置）做距离；AutoSeg3D 当前 DACA 使用 `sp_pos_list`（来源于 decoder 内的点坐标），必须明确它对应的是哪套坐标（aug? elastic?）
+- **early fusion 维度未对齐 SegDINO3D**：SegDINO3D 是 `points_2dfeats=256d` 直接拼入 UNet；而 AutoSeg3D 当前 SV 路线 A 配置（`AutoSeg3D/configs/scannet200/AutoSeg3D_sv_scannet200_routeA_gdino.py`）是 `gdino_in_dim=256 → gdino_out_dim=32`，UNet 输入因此是 `3+32`，这更像“轻量注入”而不是 SegDINO3D‑style early fusion（需要在配置里提供 256d 对齐开关）
+- **loss/matcher 未对齐 SegDINO3D 的 center/size 监督**：AutoSeg3D 当前 InstanceCriterion 与 bbox_flag 配置（center/size L1、box modulation）仍不完整；这会削弱 query/geometry 对齐能力
+- **现有 `_run_gdino_daca2d_for_frame()` 尚未完全遵守 raw_proj_space → decoder_space_wo_elastic 的约定**：当前实现直接用 `batch_inputs_dict['points']` 投影并选 support points，但 point_fusion 已经表明“训练时必须 reverse aug 才能保证与 pose/intr 对齐”；因此 DACA‑2D 的 support 选点也必须复用同样的 reverse‑aug 投影逻辑，否则会出现 “valid_ratio 看似不低但 box‑support 语义漂移” 的隐蔽失真。
+
+---
+
+# -3. 最关键的第一性约束：DACA‑2D 的三套空间必须写清并强制一致
+
+SegDINO3D 的经验是：**DACA‑2D 很容易“启用但无效”，原因不是网络，而是空间错位**。在 AutoSeg3D 里必须把三套空间明确成硬约定：
+
+## -3.1 三套空间定义（建议命名）
+
+- `raw_proj_space`：用于 2D 投影 / in_box 选 support points 的空间  
+  - 必须与相机 `pose/intr` 一致（不受 3D aug 影响）  
+  - 对应 AutoSeg3D 已在 point_fusion 做的：`apply_3d_transformation(reverse=True)` 后再投影
+
+- `decoder_space_wo_elastic`：decoder 里做“距离门控”的空间（DACA mask 的距离阈值就在这个空间里）  
+  - 必须与 decoder 内 `sp_pos_list` 的坐标同一套（同一 augmentation，但**不含 elastic**）  
+  - SegDINO3D 用 `pos_wo_elastic` 明确做到这一点
+
+- `decoder_space_elastic`：如果启用了 elastic deformation（仅用于特征学习），它不应进入 DACA 的几何距离
+
+## -3.2 直接结论（必须按此实现，否则 DACA 无意义）
+
+- **in_box/support points 的判定必须在 raw_proj_space 做**（否则 box-support 语义错位）
+- **query2d_pos 必须写入 decoder_space_wo_elastic**（否则 DACA 距离阈值错位）
+- **DACA 距离计算必须使用 sp_pos_wo_elastic（而不是 elastic 后的位置）**
+
+> 这也是你之前在 ESAM 的 point_fusion 链路能达到 valid≈1 的根因：投影与相机几何一致；把同样原则复制到 DACA‑2D 的 q_pos 上，才能让 DACA 真正“触发”。
+
 # 0. 第一版范围（必须严格遵守，避免策略污染）
 
 **只做在线提取（不做离线落盘、不改 decoder、不改 merge 策略）**
@@ -243,7 +338,7 @@ AutoSeg3D 的 MV stage2 数据加载（`LoadAdjacentDataFromFile`）默认不加
 
 # 第二版（V2）：单帧 DACA‑2D（使用 GroundingDINO full forward 的 `hs_last` + distance‑aware mask），先接入 AutoSeg3D Decoder
 
-> 本节是“第二版”的工程设计稿：**面向 AutoSeg3D 的在线 RGB‑D 单帧处理**，不再讨论 SegDINO3D 的多视角 Nearest View Sampling。  
+> 本节是“第二版”的工程设计稿：**面向 AutoSeg3D 的在线 RGB‑D 单帧处理**。  
 > 因为 AutoSeg3D 的输入是连续帧，但处理逻辑是逐帧（`oneformer3d/mixformer3d.py` 中按 `frame_i` 循环取 `batch_inputs_dict['points'][i][frame_i]`），并且每帧 RGB 与 depth（从而 3D 点）天然一一对应，因此 2D→3D 融合是**单帧内投影/反投影**问题。
 
 ## V2 的核心动机（与 V1 的差异）
@@ -364,6 +459,33 @@ V2 必须做裁剪（否则太慢/太大）：
 
 这一步决定 DACA mask 是否有效。单帧下不需要 depth map：直接用当前帧点云 `xyz_world` 投影到 2D box。
 
+#### 为什么需要“box 内 support points”，不能只靠 2D box 数学计算？
+
+`pred_boxes(cxcywh)` 本质是 **2D 图像平面上的区域**。它并不携带深度，因此**无法唯一确定一个 3D 位置**：同一个 2D box 对应一条视锥（frustum）。  
+在 RGB‑D/点云场景里，3D anchor 的“正解”只能来自深度（或点云）：
+
+- 你可以“用 depth map 在 box 内做统计”得到一个 3D 点（等价于 support points）
+- 你也可以“用点云投影到 box 内筛 support points”，再用 median/mean/medoid 得到 anchor（工程上更直接，且与后续 3D 点/超点索引天然对齐）
+
+因此：support points 不是为了“更复杂”，而是为了把 2D box **lift 成一个 3D anchor（query2d_pos）**，让 DACA 的距离门控在 3D 空间有意义。
+
+#### 对齐风险点（非常关键）：raw 投影 + aug 写入（并且 DACA 距离在 wo_elastic 空间）
+
+训练时 AutoSeg3D 存在 3D aug（rot/scale/trans/flip + 可能的 elastic）。相机参数（pose/intr）对应的是**原始相机几何**，因此：
+
+- **in_box 判定必须用 raw_proj_space 的点去投影**（即把增强后的点先 reverse 回相机一致的空间再投影）
+- 但 **query2d_pos 必须写入 decoder_space_wo_elastic**（与 decoder 内 DACA 距离门控空间一致）
+
+最稳的实现约定（与你们已验证的 point_fusion 经验一致）：
+
+1) 用 `xyz_aug`（当前 batch 的点坐标）通过 `apply_3d_transformation(reverse=True)` 得到 `xyz_raw_for_proj`  
+2) 用 `xyz_raw_for_proj` + `pose/intr` 投影得到 uv，并做 in_box/support selection（raw_proj_space）  
+3) 对同一批点的索引集合 `in_box_idx`，回到 `xyz_aug_wo_elastic`（或“与 sp_pos_list 一致的坐标”）上取这些点的坐标，计算 median 得 `query2d_pos`（decoder_space_wo_elastic）  
+4) decoder 内 DACA mask 的距离必须用 `sp_pos_wo_elastic` 与 `query2d_pos` 计算（不要用 elastic 后的位置）
+
+> SegDINO3D 代码里显式使用 `pos_wo_elastic` 做 DACA 距离：`dist = cdist(pos_wo_elastic, dinox_query_pos, p=1)`。  
+> AutoSeg3D 若不引入 “sp_pos_wo_elastic” 的显式接口，就必须保证 `sp_pos_list` 本身就是 wo_elastic 空间，否则 DACA 阈值与距离将失去物理意义。
+
 步骤（每帧）：
 1) 用 `cam_info` 将 `xyz_world -> uv`（图像坐标或特征图坐标均可，但必须与 `pred_boxes` 对齐同一空间）
 2) 把 `pred_boxes(cxcywh)` 转为像素 box（xmin,ymin,xmax,ymax），空间与 uv 一致（img_size=420×560）
@@ -409,7 +531,11 @@ AutoSeg3D 当前的 `ScanNetMixQueryDecoder.forward_iter_pred()` 内，每个 tr
 因此 V2 里 `order` 的含义要明确落到“插入点”：
 
 - `order="paper"`：把 DACA‑2D 插在 **cross-attn 之后、self-attn 之前**
-- `order="code"`：把 DACA‑2D 插在 **self-attn 之后、FFN 之前**（与 SegDINO3D 开源实现一致）
+- `order="code"`：把 DACA‑2D 插在 **self-attn 之后、FFN 之前**（与 SegDINO3D 开源代码的执行顺序一致）
+
+> 重要校准：论文中描述的顺序是 `3D cross-attn → DACA‑2D → 3D self-attn → FFN`；  
+> 但 SegDINO3D 开源实现里实际是 `3D cross-attn → 3D self-attn → DACA‑2D → FFN`（见 `SegDINO3D/segdino3d/models/decoder/instance_seg_3d_decoder.py: forward_iter_pred`）。  
+> 因此 AutoSeg3D 这里同时保留 paper/code 两种插入点是合理的：用实验消融裁决即可。
 
 这两种插入点都只改变 query 表示，不会改变现有 `_forward_head` 产出的 mask 维度；因此适合作为纯顺序消融。
 
@@ -465,6 +591,45 @@ SegDINO3D 的 DACA‑2D mask 不是简单的 `dist<thr`，而是利用“当前 
 
 ---
 
+## V2‑C：SegDINO3D‑style 的 UNet early‑fusion（256d points_2dfeats，送入 MinkUNet）
+
+这部分是你最终要“完整复现 SegDINO3D 路径”时必须补齐的第二条腿（与 DACA‑2D 并列）。仅靠 decoder 注入通常不足以带来稳定增益。
+
+SegDINO3D 的结构约束（必须对齐）：
+- UNet 输入：`[rgb(3), points_2dfeats(256)]`（等价 `in_channels = 256 + 3`；xyz 坐标不作为特征通道，而是 MinkowskiEngine 的坐标）
+- UNet 输出：`out_channels=96`，再进入 decoder 的 `input_proj (96→256)`
+
+AutoSeg3D 当前已有的基础设施：
+- `_run_gdino_point_fusion_for_frame()` 已能对每帧：`project → sample srcs[level] → 得到 per-point 2D feat` 并监控 `valid_ratio`
+
+尚需明确并对齐的关键点（必须写进后续实现计划）：
+- **points_2dfeats 维度**：需要支持输出 256d（而不是压缩到 32d）作为可选配置，才能与 SegDINO3D 可比
+- **特征层选择**：SegDINO3D 的 256d 对应其 2D backbone 的 d_model；GDINO 的 `srcs` 也是 256d，理论上可以直接使用（避免再 MLP 投影导致信息瓶颈）
+- **拼接位置**：必须发生在 MinkUNet 第一个卷积之前（即真正的 early fusion），而不是 decoder 里 late fusion
+
+建议 V2.1 的最小可跑版本：
+- 先只取单尺度 `srcs[level=0]`（最密）→ point_fusion 得 `points_2dfeats_256`
+- 仅做拼接进入 UNet（不做任何新损失），验证训练/推理链路正确
+
+---
+
+## V2‑D：与 SegDINO3D 对齐的 “box center/size” 监督与 matcher（后续阶段）
+
+这不是“现在就要改”的部分，但必须提前把事实写清楚，避免继续误解成“SV 数据缺 bboxes_3d”：
+
+- SegDINO3D 的 `instance_centers/instance_sizes` 是**运行时从 GT mask + 点坐标计算出来**，不是数据集字段
+- 因此 AutoSeg3D 若要对齐，需要在训练 forward（loss 之前）补一个与 `Baseline3D.get_extra_instance_data()` 等价的步骤：
+  - 输入：GT instance masks（n_inst,n_pts）+ 点坐标（优先用 `pos_wo_elastic`）
+  - 输出：`instance_centers/instance_sizes` 写入 targets/data_samples
+  - matcher 加 `CenterL1Cost/SizeL1Cost`，loss 加对应 L1 项
+
+此外 SegDINO3D 的 decoder 还有：
+- `box_modulate_ca`（cross-attn 的 box size modulation）
+- `normalize_box_prediction`
+这些属于“结构增强”，建议在 V2.2 之后再考虑（先把 early fusion + DACA‑2D 跑稳）。
+
+---
+
 ## V2 关键风险与应对（必须提前写死）
 
 1) **full GDINO 计算成本过高**
@@ -483,4 +648,214 @@ SegDINO3D 的 DACA‑2D mask 不是简单的 `dist<thr`，而是利用“当前 
 
 # V2 记录（changelog）
 
-- 2026-01-17：V2 设计稿：面向 AutoSeg3D 的在线单帧 RGB‑D，采用 GDINO full forward 的 `hs_last` + DACA‑2D distance-aware mask 注入 decoder（不再讨论多视角 Nearest View Sampling）。
+- 2026-01-17：V2 设计稿：面向 AutoSeg3D 的在线单帧 RGB‑D，采用 GDINO full forward 的 `hs_last` + DACA‑2D distance-aware mask 注入 decoder。
+- 2026-01-21：补充 V3 对齐清单：offline SV 验证、DACA‑2D mask L1 对齐、decoder 深度对齐（6 层 ablation）、center/size 监督的运行时计算与 matcher/loss 对齐。
+
+---
+
+# 第三版（V3）：SV 单帧训练“一次到位”对齐 SegDINO3D（early fusion + object-level DACA‑2D + box center/size loss）
+
+你当前明确要求：**第一轮训练就以“完整更改后的模型形态”训练**（UNet / decoder / loss 都按 SegDINO3D 对齐），中间只允许做最小自测（投影 valid_ratio、维度一致性、loss 不 NaN）。
+
+本节给出“可直接落地改代码”的清晰计划：每个模块的输入输出维度、需要新增/改动的接口、以及必须对齐的超参开关。
+
+> 重要说明：AutoSeg3D 与 SegDINO3D 的 3D backbone 同属 Res16UNet34 系列（OneFormer3D lineage）。  
+> 它们的“每一层结构（planes/blocks/stride）”可以保持一致；真正决定差异的是：**输入通道数、2D 特征是否 early-fusion、decoder 是否启用 box positional embedding 与 DACA‑2D**。  
+> 因此 V3 的目标不是“改出一个新 UNet”，而是“把 UNet 的输入/融合方式、decoder 的注入与 loss 监督”对齐到 SegDINO3D。
+
+## V3‑0：总开关（SV 单帧训练）
+
+### 目标运行形态（强制）
+- 数据：SV（每样本 `T=1`），RGB 与 depth/点云天然一一对应（**无需最近视角采样**）
+- 2D backbone：GroundingDINO（在线提取），必须 full forward 得 `hs_last/pred_boxes/pred_scores`
+- 3D backbone：Res16UNet34C（MinkowskiEngine）
+- decoder：保留原有 3D CA 主干，同时增加 DACA‑2D（**仅 SP 域注入**）
+- loss：matcher + loss 同时加入 center/size 监督（与 SegDINO3D 一致）
+
+### 非常重要：SV 训练必须先在 “offline detector” 上对齐验证
+AutoSeg3D 的 Online 类（`ScanNet200MixFormer3D_Online`）会引入 `memory/merge` 等在线机制，即便你把 `use_query_memory=False`，仍可能在 forward/predict 路径里走到不同的分支，给“2D 注入是否有效”的判断带来干扰。
+
+因此 V3 的**对齐验证顺序**必须是：
+1) **offline SV**：`ScanNet200MixFormer3D`（或对应的 offline detector），`T=1`，只验证“2D 注入 + loss”是否按 SegDINO3D 生效  
+2) 通过后再迁移到 Online（Stage2 / online reconstruction），否则会把“tracking/memory 的系统行为”与“2D 注入是否有效”混在一起
+
+### V3 对齐清单（最小但关键）
+以下 4 条是“最小但关键”的对齐项，优先级从高到低（任何一条缺失都会显著削弱 SegDINO3D 的收益路径）：
+1) **DACA‑2D mask 距离度量改为 L1（p=1）**：`mask.metric='l1'`，`thr=0.2` 保持不变  
+   - SegDINO3D 是 `torch.cdist(..., p=1)`；若用 L2@0.2 会更严格，导致可 attend 的 2D query 更少，注入更弱。
+2) **decoder 深度对齐到 6 层（至少做 ablation）**：`num_layers: 3 → 6`  
+   - 先验证“注入深度不足导致 2D 信息无法传递”这一假设；再决定是否进一步对齐 decoder 结构（box‑modulated CA 等）。
+3) **加入 center/size 监督（matcher cost + loss）**：实现 SegDINO3D 的 `CenterL1Cost/SizeL1Cost` 与对应 L1 loss  
+   - 注意：center/size GT 是运行时从 GT mask + 点坐标算出来的（不是数据集提供 bbox）。
+4) **保持原 3D CA 主干不被覆盖**：DACA‑2D 作为 SP 域的增量注入模块  
+   - 不应删/替换原有 3D cross‑attn/self‑attn；DACA‑2D 是“额外一条信息通路”，不是主干替代。
+
+## V3‑1：Point‑level early fusion（严格对齐 SegDINO3D：256d 直接进 UNet）
+
+### 目标（对齐事实）
+
+SegDINO3D 的 early fusion 是：
+- `points_2dfeats ∈ R^{N×256}` 直接拼接到点特征里（不做 256→32 压缩）
+- UNet `in_channels = 256 + 3`（3 是 RGB；xyz 是坐标，不是 feature channel）
+
+### AutoSeg3D 当前差异（需要修）
+- 现有 SV routeA 配置是 `gdino_in_dim=256 → gdino_out_dim=32`，UNet 输入为 `3+32`（轻量注入）
+
+### V3 实施方案（接口级）
+
+1) `gdino_point_fusion.out_dim=256`（与 `srcs[level].C=256` 对齐）
+2) 让 `gdino_point_fusion` 输出的每点特征 **不再额外降维**：
+   - 最稳妥：把 `self._gdino_point_proj` 设为 identity（或 256→256 的 Linear 但默认可不启用）
+3) UNet 输入通道改为：
+   - `backbone.in_channels = 3 + 256 = 259`
+4) 训练增强：
+   - 引入与 SegDINO3D 一致的 `dropout_rate_2dfeats`（例如 0.7）在训练时随机 dropout `points_2dfeats`（只对 2D 部分做 dropout，不动 RGB）
+
+### 关键 I/O（落到张量维度）
+
+- 输入点特征：`feat_in = concat([rgb(3), gdino_point_feats(256)]) -> (N,259)`
+- UNet 输出：`point_feat_3d = (N,96)`（与现有 decoder input_proj 对齐）
+
+> 备注：这会导致 UNet 第一层卷积权重 shape 改变，因此不能直接加载旧 backbone 权重；你已经接受从头训练，这点是预期行为。
+
+## V3‑2：Object‑level DACA‑2D（严格对齐 SegDINO3D：pos_wo_elastic 做距离门控）
+
+### 目标（对齐事实）
+
+SegDINO3D 的 DACA‑2D（见 `SegDINO3D/segdino3d/models/decoder/instance_seg_3d_decoder.py`）要求：
+- `dinox_queries (Nq2d,256)`：2D object queries embedding
+- `dinox_query_pos (Nq2d,3)`：每个 2D query 的 3D anchor
+- 距离门控用 `pos_wo_elastic (Nsp,3)` 与 `dinox_query_pos (Nq2d,3)` 做 `cdist`
+
+### AutoSeg3D 当前状态（可复用但需“空间对齐修复”）
+
+已存在：
+- `_run_gdino_daca2d_for_frame()`：可构造 `query2d_feats/query2d_pos`
+- `QueryDecoder._apply_daca2d()`：SP 域 DACA mask + cross-attn 注入
+
+必须修复/保证：
+- `query2d_pos` 必须写入 decoder 的 **wo_elastic 距离空间**
+- `sp_pos_list` 必须来自同一 wo_elastic 空间（不能用 elastic 后的点坐标）
+- `in_box` support selection 必须使用 raw 投影（reverse aug）与 pose/intr 一致
+
+### V3 实施方案（接口级）
+
+1) 在 `extract_feat()` 返回值/中间缓存里，显式提供两套 SP 位置：
+   - `sp_pos_wo_elastic`：用于 DACA‑2D 的距离门控（必需）
+   - （可选）`sp_pos_elastic`：仅用于特征学习，不参与距离阈值
+2) `_run_gdino_daca2d_for_frame()` 改为“两段式空间处理”：
+   - raw 投影空间：用 `xyz_raw_for_proj` 选出 in_box 点索引
+   - decoder 空间：用同一索引在 `xyz_aug_wo_elastic` 上取 median 得 `query2d_pos`
+3) DACA‑2D 注入域固定：
+   - `inject_domain="sp"`（你要求 SP 域注入）
+   - P 域不注入（避免维度/口径漂移）
+4) decoder 层顺序：保留两种 order 做消融：
+   - paper：cross-attn → DACA‑2D → self-attn → FFN
+   - code：cross-attn → self-attn → DACA‑2D → FFN
+
+### V3‑2.1 关键对齐：mask.metric 必须与 SegDINO3D 一致（L1）
+SegDINO3D 的 DACA‑2D 距离门控是：
+- `dist = torch.cdist(pos_wo_elastic, dinox_query_pos, p=1)`（L1）
+- `mask = dist <= 0.2`
+
+因此 AutoSeg3D 的 `gdino_daca2d.mask` 必须对齐为：
+- `mask.metric='l1'`
+- `mask.thr=0.2`
+
+并在日志/monitor 中固定输出：
+- `nq_keep_mean / nq_pos_mean / qpos_rate_mean`（确保 object-level 的 query2d_pos 真在产生）
+- `empty_mask_rows_rate`（确保 DACA mask 没把 attention 全置空）
+
+## V3‑3：Decoder 与 bbox/positional embedding（对齐 SegDINO3D 的 box modulation/normalize）
+
+SegDINO3D 的有效工程增强不止 DACA‑2D，还包含：
+- `add_positional_embedding=True`（3D query/point positional embedding）
+- `add_box_size_pred=True`（预测 size）
+- `box_modulate_ca=True`（用 box size modulation cross-attn）
+- `normalize_box_prediction=True`
+
+### V3 实施策略（可落地、避免大改 SP/P 混合）
+
+优先级建议：
+1) **先把 center/size 的输出接口补齐**（`pred_centers/pred_sizes`）并打通 loss（见下一节）
+2) 再实现 `box_modulate_ca/normalize_box_prediction`（需要在 cross-attn 层对 query_pos 做 modulation，属于结构改动，但逻辑可以直接参考 SegDINO3D）
+
+注意：AutoSeg3D 的 decoder（`ScanNetMixQueryDecoder`）目前已有：
+- `bbox_flag` 与 `out_reg (d_model→6)`（axis-aligned bbox）
+但缺少：
+- `add_positional_embedding/add_box_size_pred/box_modulate_ca/normalize_box_prediction` 这一整套
+
+因此 V3 建议采用“显式对齐 SegDINO3D”的方式：
+- 新增一个 decoder 分支/新 decoder 类，代码结构尽量贴近 `SegDINO3D/segdino3d/models/decoder/instance_seg_3d_decoder.py`
+- 仍可复用 AutoSeg3D 现有的 SP/P 掩码预测（如果你决定保留 P 域 refine），但 **DACA‑2D 只作用于 SP 域层**
+
+### V3‑3.1 最小可落地的 decoder 深度对齐（先做 ablation）
+在不立刻重写 decoder 的前提下，先做一组“最小深度对齐”验证：
+- `ScanNetMixQueryDecoder.num_layers: 3 → 6`
+- 同时确保 `mask_pred_mode` 至少在前若干层为 `SP`（否则 SP 域不会触发 DACA‑2D 注入）
+- 保持原 3D cross‑attn/self‑attn 逻辑不变，DACA‑2D 只作为额外模块插入（不会改变主干注意力）
+
+这一步的目的不是“直接达到最佳”，而是快速回答一个关键问题：  
+**2D 注入在 3 层 decoder 上会不会天然用不起来？如果 6 层明显更好，再投入实现 box‑modulated CA 等更重改动。**
+
+## V3‑4：Loss/Matcher（对齐 SegDINO3D：CenterL1Cost + SizeL1Cost + loss_weight）
+
+### SegDINO3D 的事实（必须对齐）
+
+在 `SegDINO3D/configs/prototypes/SegDINO3D_ScanNet200.py`：
+- matcher costs 增加：
+  - `CenterL1Cost(weight=0.5)`
+  - `SizeL1Cost(weight=0.5)`
+- `loss_weight = [0.5, 1.0, 1.0, 0.5, 0.5, 0.5]`
+- `add_positional_embedding=True`
+- `decoder_cfg.add_box_size_pred=True`
+- `decoder_cfg.box_modulate_ca=True`
+- `decoder_cfg.normalize_box_prediction=True`
+
+### GT center/size 的来源（不是数据集字段）
+
+SegDINO3D 在训练时由 GT mask + 点坐标计算：
+- `instance_centers (n_inst,3)`
+- `instance_sizes (n_inst,3)`
+对应实现：`SegDINO3D/segdino3d/models/architecture/baseline3d.py:get_extra_instance_data()`
+
+### V3 实施方案（接口级）
+
+1) 在 AutoSeg3D 的训练 forward（loss 前）增加等价的 `get_extra_instance_data()`：
+   - 输入：GT instance masks（按你 SV 的 GT 表示） + 点坐标（必须用 `pos_wo_elastic`）
+   - 输出：写入 `data_sample.gt_instances.instance_centers/instance_sizes`
+2) matcher 增加 `CenterL1Cost/SizeL1Cost`；loss 增加对应项
+3) `loss_weight` 按 SegDINO3D 对齐（并明确每一项对应哪个 loss，避免长度对不上）
+
+### V3‑4.1 center/size GT 的“运行时计算”定义（对齐 SegDINO3D）
+SegDINO3D 不是依赖数据集 bbox，而是在训练时由 GT mask + 点坐标计算：
+- 对每个 GT instance，取其点集 `P = {x_k ∈ R^3}`（使用与 decoder 一致的 `pos_wo_elastic` 空间）
+- `center = (P.min(dim=0) + P.max(dim=0)) / 2`（axis-aligned bbox center）
+- `size = P.max(dim=0) - P.min(dim=0)`（axis-aligned bbox size）
+
+写入到 targets 后：
+- matcher cost 用 `L1(center_pred, center_gt)` 与 `L1(size_pred, size_gt)` 参与 assignment
+- loss 用对应的 L1 监督（权重参考 SegDINO3D 的 loss_weight 第 5/6 项）
+
+> 这一步的意义：让 3D queries 学到更稳定的几何对齐能力（尤其在你只做 SP 域 DACA 注入时，几何对齐更关键）。
+
+## V3‑5：你要的新 SV 配置文件（建议命名与关键参数）
+
+建议新增（不要污染旧 config）：
+- `AutoSeg3D/configs/scannet200/AutoSeg3D_sv_scannet200_segdino3d_v3.py`
+
+关键差异参数（相对 routeA_gdino）：
+- `gdino_point_fusion.out_dim = 256`（不再压缩）
+- `backbone.in_channels = 259`
+- `gdino_daca2d.enable=True` 且 `mode="fuse"`（训练也开启）
+- decoder：启用 positional embedding + center/size 预测 + box modulation（按 SegDINO3D 对齐）
+- criterion/matcher：加入 Center/Size 监督与 loss_weight 对齐
+
+## V3‑6：最小自测（训练前必须通过）
+
+在正式开始训练前，必须一次性通过下面的 sanity（只跑 1–2 iter 即可）：
+- `gdino_point_fusion.valid_ratio_mean >= 0.99`（每帧）
+- early fusion 维度一致：`rgb(3)+2d(256)=259`，UNet 第一层不报维度 mismatch
+- `query2d_pos` 的 `query_pos_valid_rate` 不为 0（否则 DACA 退化）
+- DACA mask 不全空：`empty_mask_rows_rate` 低且 dummy query 生效
+- loss 端：center/size loss 不为 NaN，且 matched 数量合理

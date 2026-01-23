@@ -400,12 +400,24 @@ class MixedInstanceCriterion:
         if indices is None:
             indices = []
             for i in range(len(insts)):
-                pred_instances = InstanceData(
-                    scores=cls_preds[i],
-                    masks=pred_masks[i])
+                pred_instances = InstanceData(scores=cls_preds[i], masks=pred_masks[i])
+                # Optional geometry fields for Center/Size costs.
+                try:
+                    pb = pred_bboxes[i]
+                    pc = centers[i]
+                    if torch.is_tensor(pb) and torch.is_tensor(pc):
+                        pred_instances.bboxes = pb
+                        pred_instances.centers = pc
+                except Exception:
+                    pass
                 gt_instances = InstanceData(
                     labels=insts[i].labels_3d,
                     masks=insts[i].sp_masks if mode == "SP" else insts[i].p_masks)
+                try:
+                    if hasattr(insts[i], "bboxes_3d") and torch.is_tensor(insts[i].bboxes_3d):
+                        gt_instances.bboxes_3d = insts[i].bboxes_3d
+                except Exception:
+                    pass
                 if insts[i].get('query_masks') is not None:
                     gt_instances.query_masks = insts[i].query_masks
                 if top_k is not None:
@@ -586,12 +598,24 @@ class MixedInstanceCriterion:
         # match
         indices = []
         for i in range(len(insts)): # batch_size
-            pred_instances = InstanceData(
-                scores=cls_preds[i],
-                masks=pred_masks[i])
+            pred_instances = InstanceData(scores=cls_preds[i], masks=pred_masks[i])
+            # Optional geometry fields for Center/Size costs.
+            try:
+                pb = pred_bboxes[i]
+                pc = centers[i]
+                if torch.is_tensor(pb) and torch.is_tensor(pc):
+                    pred_instances.bboxes = pb
+                    pred_instances.centers = pc
+            except Exception:
+                pass
             gt_instances = InstanceData(
                 labels=insts[i].labels_3d,
                 masks=insts[i].p_masks) # mask_pred_mode[-1] is "P"
+            try:
+                if hasattr(insts[i], "bboxes_3d") and torch.is_tensor(insts[i].bboxes_3d):
+                    gt_instances.bboxes_3d = insts[i].bboxes_3d
+            except Exception:
+                pass
             if insts[i].get('query_masks') is not None:
                 gt_instances.query_masks = insts[i].query_masks
             # All-False-gt_mask will not be matched 
@@ -613,6 +637,7 @@ class MixedInstanceCriterion:
             matched_indices = indices
         # 3 other losses 掩码损失、BBox损失、得分损失
         score_losses, bbox_losses, mask_bce_losses, mask_dice_losses = [], [], [], []
+        center_l1_losses, size_l1_losses = [], []
         for mask, score, bbox, center, inst, (idx_q, idx_gt) in zip(pred_masks, pred_scores, 
                                                       pred_bboxes, centers, insts, indices):
             if len(inst) == 0:
@@ -632,14 +657,25 @@ class MixedInstanceCriterion:
                 pred_bbox = bbox[idx_q]
                 sp_center = center[idx_q]
                 tgt_bbox = inst.bboxes_3d[idx_gt, :6]
-                if len(tgt_bbox) == 0:
+                if tgt_bbox.numel() == 0:
                     bbox_losses.append(torch.tensor(0.0).to(pred_mask.device))
                 else:
-                    bbox_loss = self.bbox_loss(
-                        self._bbox_to_loss(
-                            self._bbox_pred_to_bbox(sp_center, pred_bbox)),
-                        self._bbox_to_loss(tgt_bbox))
-                    bbox_losses.append(bbox_loss)
+                    # Filter invalid GT bbox rows (e.g. semantic rows padded with zeros).
+                    valid_bbox = (tgt_bbox[:, 3:6].abs().sum(-1) > 0)
+                    if valid_bbox.sum().item() == 0:
+                        bbox_losses.append(torch.tensor(0.0).to(pred_mask.device))
+                    else:
+                        pred_bbox_f = pred_bbox[valid_bbox]
+                        sp_center_f = sp_center[valid_bbox]
+                        tgt_bbox_f = tgt_bbox[valid_bbox]
+                        abs_bbox_f = self._bbox_pred_to_bbox(sp_center_f, pred_bbox_f)
+                        bbox_loss = self.bbox_loss(
+                            self._bbox_to_loss(abs_bbox_f),
+                            self._bbox_to_loss(tgt_bbox_f))
+                        bbox_losses.append(bbox_loss)
+                        # Optional SegDINO3D-style center/size L1 losses
+                        center_l1_losses.append(F.l1_loss(abs_bbox_f[:, :3], tgt_bbox_f[:, :3], reduction='mean'))
+                        size_l1_losses.append(F.l1_loss(abs_bbox_f[:, 3:6], tgt_bbox_f[:, 3:6], reduction='mean'))
 
             # check if skip objectness loss
             if score is not None: # 这个没有用到
@@ -658,6 +694,15 @@ class MixedInstanceCriterion:
             bbox_loss = torch.stack(bbox_losses).sum() / len(pred_masks)
         else:
             bbox_loss = 0
+
+        if len(center_l1_losses):
+            center_l1_loss = torch.stack(center_l1_losses).sum() / len(pred_masks)
+        else:
+            center_l1_loss = 0
+        if len(size_l1_losses):
+            size_l1_loss = torch.stack(size_l1_losses).sum() / len(pred_masks)
+        else:
+            size_l1_loss = 0
         
         if len(score_losses):
             score_loss = torch.stack(score_losses).sum() / len(pred_masks)
@@ -686,6 +731,15 @@ class MixedInstanceCriterion:
             self.loss_weight[2] * mask_dice_loss +
             self.loss_weight[3] * score_loss +
             self.loss_weight[4] * bbox_loss)
+        # Optional extra weights for center/size L1 (backward compatible).
+        try:
+            if isinstance(self.loss_weight, (list, tuple)):
+                if len(self.loss_weight) > 5:
+                    loss = loss + float(self.loss_weight[5]) * center_l1_loss
+                if len(self.loss_weight) > 6:
+                    loss = loss + float(self.loss_weight[6]) * size_l1_loss
+        except Exception:
+            pass
 
         if 'aux_outputs' in pred: # True
             if mot_type is None:
@@ -795,6 +849,68 @@ class MaskDiceCost:
         """
         cost = batch_dice_loss(
             pred_instances.masks, gt_instances.masks.float())
+        return cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class CenterL1Cost:
+    """L1 distance cost on axis-aligned bbox centers.
+
+    Requires:
+    - pred_instances.bboxes: (n_queries, 6) predicted (dx,dy,dz,w,h,l)
+    - pred_instances.centers: (n_queries, 3) reference centers (xyz)
+    - gt_instances.bboxes_3d: (n_gts, >=6) target (x,y,z,w,h,l,...)
+    """
+
+    def __init__(self, weight):
+        self.weight = float(weight)
+
+    def __call__(self, pred_instances, gt_instances, **kwargs):
+        pred_bbox = getattr(pred_instances, 'bboxes', None)
+        pred_center = getattr(pred_instances, 'centers', None)
+        gt_bbox = getattr(gt_instances, 'bboxes_3d', None)
+        if pred_bbox is None or pred_center is None or gt_bbox is None:
+            return pred_instances.scores.new_zeros((pred_instances.scores.shape[0], gt_instances.labels.shape[0]))
+        if pred_bbox.numel() == 0 or gt_bbox.numel() == 0:
+            return pred_instances.scores.new_zeros((pred_bbox.shape[0], gt_bbox.shape[0]))
+
+        abs_bbox = MixedInstanceCriterion._bbox_pred_to_bbox(pred_center, pred_bbox)
+        pred_c = abs_bbox[:, :3]
+        gt_c = gt_bbox[:, :3]
+        valid_gt = (gt_bbox[:, 3:6].abs().sum(-1) > 0)
+        cost = torch.cdist(pred_c, gt_c, p=1)
+        if valid_gt.any():
+            cost = cost * valid_gt.to(dtype=cost.dtype).unsqueeze(0)
+        else:
+            cost.zero_()
+        return cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class SizeL1Cost:
+    """L1 distance cost on axis-aligned bbox sizes (w,h,l)."""
+
+    def __init__(self, weight):
+        self.weight = float(weight)
+
+    def __call__(self, pred_instances, gt_instances, **kwargs):
+        pred_bbox = getattr(pred_instances, 'bboxes', None)
+        pred_center = getattr(pred_instances, 'centers', None)
+        gt_bbox = getattr(gt_instances, 'bboxes_3d', None)
+        if pred_bbox is None or pred_center is None or gt_bbox is None:
+            return pred_instances.scores.new_zeros((pred_instances.scores.shape[0], gt_instances.labels.shape[0]))
+        if pred_bbox.numel() == 0 or gt_bbox.numel() == 0:
+            return pred_instances.scores.new_zeros((pred_bbox.shape[0], gt_bbox.shape[0]))
+
+        abs_bbox = MixedInstanceCriterion._bbox_pred_to_bbox(pred_center, pred_bbox)
+        pred_s = abs_bbox[:, 3:6]
+        gt_s = gt_bbox[:, 3:6]
+        valid_gt = (gt_bbox[:, 3:6].abs().sum(-1) > 0)
+        cost = torch.cdist(pred_s, gt_s, p=1)
+        if valid_gt.any():
+            cost = cost * valid_gt.to(dtype=cost.dtype).unsqueeze(0)
+        else:
+            cost.zero_()
         return cost * self.weight
 
 

@@ -7,9 +7,12 @@ from mmdet3d.registry import MODELS
 @MODELS.register_module()
 class Det3DDataPreprocessor_(Det3DDataPreprocessor):
     """
-    We add only this 2 lines:
-    if 'elastic_coords' in inputs:
-        batch_inputs['elastic_coords'] = inputs['elastic_coords']
+    Custom preprocessor for AutoSeg3D.
+
+    In addition to MinkowskiEngine inputs, we keep several python-object fields
+    required by online 2D-3D fusion modules (GDINO point-fusion / DACA-2D):
+    - points_raw: raw points captured before 3D aug (projection space)
+    - img_paths / poses / cam_info: per-frame camera metadata (list structures)
     """
     def simple_process(self, data, training=False):
         """Perform normalization, padding and bgr2rgb conversion for img data
@@ -30,6 +33,7 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         data = self.collate_data(data)
         inputs, data_samples = data['inputs'], data['data_samples']
         batch_inputs = dict()
+        batch_size = len(data_samples) if data_samples is not None else 0
 
         if 'points' in inputs:
             batch_inputs['points'] = inputs['points']
@@ -40,6 +44,8 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
 
         if 'elastic_coords' in inputs:
             batch_inputs['elastic_coords'] = inputs['elastic_coords']
+        if 'points_raw' in inputs:
+            batch_inputs['points_raw'] = inputs['points_raw']
 
         if 'imgs' in inputs:
             imgs = inputs['imgs']
@@ -75,12 +81,25 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                     imgs, data_samples = batch_aug(imgs, data_samples)
             batch_inputs['imgs'] = imgs
         
+        def _maybe_time_major_to_batch_first(v):
+            if not isinstance(v, list) or batch_size <= 0:
+                return v
+            if len(v) == 0:
+                return v
+            # time-major: T x B
+            if isinstance(v[0], list) and len(v[0]) == batch_size:
+                T = len(v)
+                return [[v[t][b] for t in range(T)] for b in range(batch_size)]
+            return v
+
+        # Keep python-object metadata required by online 2D-3D fusion modules.
+        # Note: default_collate transposes list fields; convert back to batch-first.
         if 'img_paths' in inputs:
-            img_paths = []
-            for batch_idx in range(len(inputs['img_paths'][0])):
-                batch_paths = [paths[batch_idx] for paths in inputs['img_paths']]
-                img_paths.append(batch_paths)
-            batch_inputs['img_paths'] = img_paths
+            batch_inputs['img_paths'] = _maybe_time_major_to_batch_first(inputs['img_paths'])
+        if 'poses' in inputs:
+            batch_inputs['poses'] = _maybe_time_major_to_batch_first(inputs['poses'])
+        if 'cam_info' in inputs:
+            batch_inputs['cam_info'] = _maybe_time_major_to_batch_first(inputs['cam_info'])
         
         if 'img_path' in inputs:
             batch_inputs['img_path'] = inputs['img_path']

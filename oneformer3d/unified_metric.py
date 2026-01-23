@@ -509,7 +509,19 @@ class UnifiedSegMetric(SegMetric):
                     pass
                 online_monitor_results.append(mon)
 
-        if pred_instance_labels[0].max() == 0:
+        # Robustness: allow empty predictions (no instances) without crashing.
+        # Treat as cat-agnostic eval in this case.
+        max_pred_label = 0
+        try:
+            for _lb in pred_instance_labels:
+                if _lb is None:
+                    continue
+                if hasattr(_lb, "numel") and _lb.numel() > 0:
+                    max_pred_label = max(max_pred_label, int(_lb.max()))
+        except Exception:
+            max_pred_label = 0
+
+        if max_pred_label == 0:
             ret_inst = instance_cat_agnostic_eval(
                 gt_semantic_masks_inst_task,
                 gt_instance_masks_inst_task,
