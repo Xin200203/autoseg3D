@@ -1,6 +1,6 @@
 _base_ = ['./AutoSeg3D_sv_scannet200_A3_fpn_2dca_autoloss.py']
 
-# A4: FPN point fusion + 2DCA, switch to SegDINO3D-style matcher/loss settings.
+# A4: sparse-FPN injection + 2DCA, switch to SegDINO3D-style matcher/loss settings.
 # - Enable bbox head in decoder (axis-aligned).
 # - Add Center/Size L1 costs to matcher.
 # - Add center/size L1 loss weights (score loss weight set to 0 since objectness is disabled).
@@ -24,4 +24,3 @@ model = dict(
     ),
     train_cfg=dict(compute_gt_bboxes_3d=True),
 )
-

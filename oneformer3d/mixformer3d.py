@@ -20,6 +20,8 @@ from .img_backbone import point_sample, apply_3d_transformation
 import os
 from PIL import Image
 from .projection_utils import MIN_DEPTH, scale_uv_img_to_feat, project_points_to_uv, sample_img_feat
+# Sparse FPN builder (ESAM-style): point-wise 2D feats -> [s1,s2,s4,s8,s16]
+from .dino_sparse_fpn import build_sparse_fpn
 # Added
 from mmdet3d.registry import TASK_UTILS
 from mmengine.model import BaseModule
@@ -617,7 +619,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         coordinates, features = [], []
         coordinates_wo_elastic = []
 
-        # Optional: per-point 2D early fusion (GDINO srcs -> point features).
+        # Optional: point-wise GDINO features.
+        # Two modes:
+        #   - early-fusion: concat/add to RGB features before SparseTensor
+        #   - sparse-fpn: build_sparse_fpn(coords, feats) and inject into UNet decoder (no in_channels change)
         gdino_point_feats = None
         gdino_point_stats = None
         try:
@@ -631,6 +636,12 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self._last_gdino_point_fusion_stats = gdino_point_stats
 
         enable_pf = bool(self.gdino_point_fusion_cfg.get("enable", False)) if isinstance(self.gdino_point_fusion_cfg, dict) else False
+        fuse_mode = str(self.gdino_point_fusion_cfg.get("fuse_mode", "concat")).lower() if isinstance(self.gdino_point_fusion_cfg, dict) else "concat"
+        pf_mode = str(self.gdino_point_fusion_cfg.get("mode", "early")).lower() if isinstance(self.gdino_point_fusion_cfg, dict) else "early"
+        if fuse_mode in ("fpn", "sparse_fpn"):
+            pf_mode = "fpn"
+
+        gdino_sparse_fpn = None
         if enable_pf:
             ok = isinstance(gdino_point_feats, (list, tuple)) and len(gdino_point_feats) == len(batch_inputs_dict.get("points", []))
             if not ok:
@@ -638,6 +649,27 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     "[GDINO][point_fusion] enabled but no per-point features were produced. "
                     f"stats={gdino_point_stats}"
                 )
+            if pf_mode == "fpn":
+                # Build sparse pyramid from point-wise feats and the same coord source as backbone.
+                # This keeps UNet in_channels unchanged (A3/A4) and matches ESAM DINO-FPN semantics.
+                try:
+                    coords_list, feats_list = [], []
+                    for b in range(len(batch_inputs_dict["points"])):
+                        if "elastic_coords" in batch_inputs_dict and batch_inputs_dict["elastic_coords"] is not None:
+                            e = batch_inputs_dict["elastic_coords"][b]
+                            coords = torch.floor(e).to(torch.int32)
+                        else:
+                            xyz = batch_inputs_dict["points"][b][:, :3]
+                            coords = torch.floor(xyz / float(self.voxel_size)).to(torch.int32)
+                        batch_col = torch.full((coords.shape[0], 1), b, dtype=torch.int32, device=coords.device)
+                        coords_batched = torch.cat([batch_col, coords], dim=1)
+                        coords_list.append(coords_batched)
+                        feats_list.append(gdino_point_feats[b].to(device=coords.device))
+                    coords_batch = torch.cat(coords_list, dim=0)
+                    feats_batch = torch.cat(feats_list, dim=0)
+                    gdino_sparse_fpn = build_sparse_fpn(coords_batch, feats_batch)
+                except Exception as e:
+                    raise RuntimeError(f"[GDINO][point_fusion][fpn] build_sparse_fpn failed: {repr(e)}")
 
         for i in range(len(batch_inputs_dict['points'])):
             if 'elastic_coords' in batch_inputs_dict:
@@ -648,9 +680,18 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             # Keep a wo-elastic coordinate copy for DACA-2D distance gating.
             coordinates_wo_elastic.append(batch_inputs_dict['points'][i][:, :3])
             feat_i = batch_inputs_dict['points'][i][:, 3:]
-            if enable_pf:
+            if enable_pf and pf_mode != "fpn":
                 try:
-                    feat_i = torch.cat([feat_i, gdino_point_feats[i]], dim=1)
+                    if fuse_mode in ("concat", "cat"):
+                        feat_i = torch.cat([feat_i, gdino_point_feats[i]], dim=1)
+                    elif fuse_mode in ("add", "add_rgb", "sum"):
+                        if feat_i.shape[1] != gdino_point_feats[i].shape[1]:
+                            raise RuntimeError(
+                                f"add-mode requires same dim, got rgb_dim={feat_i.shape[1]} gdino_dim={gdino_point_feats[i].shape[1]}"
+                            )
+                        feat_i = feat_i + gdino_point_feats[i]
+                    else:
+                        raise RuntimeError(f"unknown fuse_mode={fuse_mode}")
                 except Exception as e:
                     raise RuntimeError(
                         "[GDINO][point_fusion] feature concat failed: "
@@ -666,7 +707,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         field = ME.TensorField(coordinates=coordinates, features=features)
 
         # forward of backbone and neck
-        x = self.backbone(field.sparse()) # [N_segment, 96]
+        if gdino_sparse_fpn is not None:
+            x = self.backbone(field.sparse(), dino_feats=gdino_sparse_fpn)  # type: ignore[call-arg]
+        else:
+            x = self.backbone(field.sparse())  # [N_segment, 96]
         if self.with_neck:
             x = self.neck(x)
         x = x.slice(field)

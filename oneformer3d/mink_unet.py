@@ -1,6 +1,7 @@
 # Adapted from JonasSchult/Mask3D.
 from enum import Enum
 from collections.abc import Sequence
+import torch
 import torch.nn as nn
 import MinkowskiEngine as ME
 import MinkowskiEngine.MinkowskiOps as me
@@ -270,8 +271,10 @@ class Res16UNetBase(BaseModule):
                  out_channels,
                  config,
                  D=3,
+                 dino_dim=None,  # Optional: point-wise 2D feature dim for sparse-FPN injection
                  **kwargs):
         self.D = D
+        self.dino_dim = dino_dim
         super().__init__()
         self.network_initialization(in_channels, out_channels, config, D)
         self.weight_initialization()
@@ -514,7 +517,118 @@ class Res16UNetBase(BaseModule):
         #     D=D)
         self.relu = MinkowskiReLU(inplace=True)
 
-    def forward(self, x, memory=None):
+        # Optional: DINO/GDINO sparse-FPN injection (decoder-level fusion)
+        # Enabled only when `dino_dim` is provided in config.
+        self.use_dino = self.dino_dim is not None
+        if self.use_dino:
+            self._last_dino_hit = {}
+            self._last_dino_fuse = {}
+            self._dino_miss_warn_count = 0
+            self._dino_min_hit_ratio = float(getattr(config, 'dino_min_hit_ratio', 0.05))
+            self._dino_strict = bool(getattr(config, 'dino_strict', False))
+            self._dino_residual = bool(getattr(config, 'dino_residual', True))
+
+            def _fuse(in_ch: int, out_ch: int):
+                return nn.Sequential(
+                    ME.MinkowskiConvolution(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=1,
+                        stride=1,
+                        bias=False,
+                        dimension=D,
+                    ),
+                    ME.MinkowskiBatchNorm(out_ch, momentum=bn_momentum),
+                    ME.MinkowskiGELU(),
+                )
+
+            # level stride=8/4/2/1 (decode stages)
+            self.dino_fuse_8 = _fuse(
+                self.PLANES[4] + self.PLANES[2] + self.dino_dim,
+                self.PLANES[4] + self.PLANES[2],
+            )
+            self.dino_fuse_4 = _fuse(
+                self.PLANES[5] + self.PLANES[1] + self.dino_dim,
+                self.PLANES[5] + self.PLANES[1],
+            )
+            self.dino_fuse_2 = _fuse(
+                self.PLANES[6] + self.PLANES[0] + self.dino_dim,
+                self.PLANES[6] + self.PLANES[0],
+            )
+            self.dino_fuse_1 = _fuse(
+                self.PLANES[7] + self.INIT_DIM + self.dino_dim,
+                self.PLANES[7] + self.INIT_DIM,
+            )
+
+            # Zero-init 1x1 conv so residual injection doesn't perturb baseline at start.
+            if self._dino_residual:
+                for m in (self.dino_fuse_8, self.dino_fuse_4, self.dino_fuse_2, self.dino_fuse_1):
+                    try:
+                        conv1x1 = m[0]
+                        if hasattr(conv1x1, 'kernel') and conv1x1.kernel is not None:
+                            conv1x1.kernel.data.zero_()
+                    except Exception:
+                        pass
+
+    def _fuse_with_dino(self, out_up, out_skip, dino_feat, fuse):
+        base_cat = me.cat(out_up, out_skip)
+        if dino_feat is None:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    f"DINO strict: missing dino_feat for tensor_stride={tuple(out_up.tensor_stride)}")
+            return base_cat
+
+        try:
+            dino_on_out = dino_feat.features_at_coordinates(out_up.coordinates.float())
+        except Exception as e:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    f"DINO strict: features_at_coordinates failed for tensor_stride={tuple(out_up.tensor_stride)}: {repr(e)}")
+            return base_cat
+
+        if dino_on_out.dim() != 2 or dino_on_out.shape[0] != out_up.features.shape[0]:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    "DINO strict: features_at_coordinates returned invalid shape "
+                    f"got={tuple(getattr(dino_on_out, 'shape', []))}, expected=({out_up.features.shape[0]}, C)")
+            return base_cat
+
+        try:
+            hit = (dino_on_out.abs().sum(dim=1) > 1e-8).float().mean().item()
+            s = int(getattr(out_up, 'tensor_stride', (0,))[0])
+            key = {1: 's1', 2: 's2', 4: 's4', 8: 's8', 16: 's16'}.get(s, f's{s}')
+            if hasattr(self, '_last_dino_hit') and isinstance(self._last_dino_hit, dict):
+                self._last_dino_hit[key] = float(hit)
+            if hit < float(getattr(self, '_dino_min_hit_ratio', 0.0)):
+                if getattr(self, '_dino_strict', False):
+                    raise RuntimeError(
+                        f"DINO strict: low hit ratio={hit:.4f} < {self._dino_min_hit_ratio:.4f} at {key}")
+                return base_cat
+        except Exception:
+            pass
+
+        dino_on_out = ME.SparseTensor(
+            features=dino_on_out,
+            coordinate_map_key=out_up.coordinate_map_key,
+            tensor_stride=out_up.tensor_stride,
+            coordinate_manager=out_up.coordinate_manager,
+        )
+        fused_in = me.cat(out_up, out_skip, dino_on_out)
+        fused_out = fuse(fused_in)
+        if getattr(self, '_dino_residual', False):
+            return base_cat + fused_out
+        return fused_out
+
+    def forward(self, x, dino_feats=None, memory=None):
+        dino_s1 = dino_s2 = dino_s4 = dino_s8 = dino_s16 = None
+        if getattr(self, 'use_dino', False) and dino_feats is not None and len(dino_feats) >= 4:
+            dino_s1 = dino_feats[0]
+            dino_s2 = dino_feats[1]
+            dino_s4 = dino_feats[2]
+            dino_s8 = dino_feats[3]
+            if len(dino_feats) >= 5:
+                dino_s16 = dino_feats[4]
+
         out = self.conv0p1s1(x) # resulotion 1 * 0.02
         out = self.bn0(out)
         out_p1 = self.relu(out) 
@@ -552,28 +666,40 @@ class Res16UNetBase(BaseModule):
         out = self.convtr4p16s2(out)
         out = self.bntr4(out)
         out = self.relu(out)
-        out = me.cat(out, out_b3p8)
+        if getattr(self, 'use_dino', False):
+            out = self._fuse_with_dino(out, out_b3p8, dino_s8, self.dino_fuse_8)
+        else:
+            out = me.cat(out, out_b3p8)
         out = self.block5(out)
 
         # pixel_dist=4
         out = self.convtr5p8s2(out)
         out = self.bntr5(out)
         out = self.relu(out)
-        out = me.cat(out, out_b2p4)
+        if getattr(self, 'use_dino', False):
+            out = self._fuse_with_dino(out, out_b2p4, dino_s4, self.dino_fuse_4)
+        else:
+            out = me.cat(out, out_b2p4)
         out = self.block6(out)
 
         # pixel_dist=2
         out = self.convtr6p4s2(out)
         out = self.bntr6(out)
         out = self.relu(out)
-        out = me.cat(out, out_b1p2)
+        if getattr(self, 'use_dino', False):
+            out = self._fuse_with_dino(out, out_b1p2, dino_s2, self.dino_fuse_2)
+        else:
+            out = me.cat(out, out_b1p2)
         out = self.block7(out)
 
         # pixel_dist=1
         out = self.convtr7p2s2(out)
         out = self.bntr7(out)
         out = self.relu(out)
-        out = me.cat(out, out_p1)
+        if getattr(self, 'use_dino', False):
+            out = self._fuse_with_dino(out, out_p1, dino_s1, self.dino_fuse_1)
+        else:
+            out = me.cat(out, out_p1)
         out = self.block8(out)
 
         return out
