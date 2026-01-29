@@ -1,144 +1,148 @@
 #!/usr/bin/env python3
-"""Make a random subset of OneFormer3D-style infos pkl.
-
-Supports two modes:
-- entry: sample K entries from data_list (useful when each entry is a scene)
-- sv_scene: sample K unique ScanNet SV scenes (when each entry is a frame)
-
-Usage:
-  python tools/make_subset_infos.py \
-    --in-pkl data/scannet200-mv_fast/scannet200_mv_oneformer3d_infos_val.pkl \
-    --out-pkl data/scannet200-mv_fast/subsets/scannet200_mv_infos_val_subset64_seed0.pkl \
-    --num-scenes 64 \
-    --seed 0
 """
+Make a small subset infos .pkl for quick smoke tests.
 
-from __future__ import annotations
+This is intentionally lightweight (pickle-in/pickle-out) and does not require
+torch/mmengine. It works for both SV and MV ScanNet200-style infos:
+- SV items often contain:  img_path (str)
+- MV items often contain:  img_paths (list[str])
+
+Example:
+  python tools/make_subset_infos.py \
+    --in /path/to/scannet200_sv_oneformer3d_infos_train.pkl \
+    --out /path/to/subset.pkl \
+    --scene scene0382_00 \
+    --max-items 4
+"""
 
 import argparse
 import json
 import os
+import os.path as osp
 import pickle
-import random
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Sequence
 
 
-def _load_infos(path: str) -> Dict[str, Any]:
+def _extract_rel_img_paths(item: Dict[str, Any]) -> List[str]:
+    if "img_path" in item and isinstance(item["img_path"], str):
+        return [item["img_path"]]
+    if "img_paths" in item and isinstance(item["img_paths"], list):
+        return [p for p in item["img_paths"] if isinstance(p, str)]
+    return []
+
+
+def _match_scene(item: Dict[str, Any], *, scene: Optional[str], scene_re: Optional[re.Pattern]) -> bool:
+    if scene is None and scene_re is None:
+        return True
+    paths = _extract_rel_img_paths(item)
+    if not paths:
+        return False
+    # Most ScanNet paths embed the scene id: "2D/sceneXXXX_XX/color/....jpg"
+    s = " ".join(paths)
+    if scene is not None and scene not in s:
+        return False
+    if scene_re is not None and scene_re.search(s) is None:
+        return False
+    return True
+
+
+def _load_pkl(path: str) -> Dict[str, Any]:
     with open(path, "rb") as f:
         obj = pickle.load(f)
-    if isinstance(obj, dict) and isinstance(obj.get("data_list", None), list):
-        return obj
-    if isinstance(obj, list):
-        return {"data_list": obj}
-    raise ValueError(f"Unsupported infos pkl format: {type(obj)} keys={getattr(obj, 'keys', lambda: [])()}")
+    if not isinstance(obj, dict) or "data_list" not in obj:
+        raise ValueError(f"unexpected pkl format: {path}")
+    if not isinstance(obj["data_list"], list):
+        raise ValueError(f"unexpected data_list type: {type(obj['data_list']).__name__}")
+    return obj
 
 
-def main() -> None:
+def _save_pkl(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(osp.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in-pkl", required=True)
-    ap.add_argument("--out-pkl", required=True)
-    ap.add_argument("--num-scenes", type=int, default=64)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--in", dest="in_path", required=True, help="input infos .pkl")
+    ap.add_argument("--out", dest="out_path", required=True, help="output subset infos .pkl")
+    ap.add_argument("--scene", default=None, help="scene id substring, e.g. scene0382_00")
+    ap.add_argument("--scene-regex", default=None, help="regex applied on image paths")
+    ap.add_argument("--max-items", type=int, default=1, help="max data_list items to keep")
     ap.add_argument(
-        "--mode",
-        type=str,
-        default="entry",
-        choices=["entry", "sv_scene"],
-        help="entry: sample K entries; sv_scene: sample K unique SV scenes (by img_path prefix).",
-    )
-    ap.add_argument(
-        "--max-entries-per-scene",
+        "--max-frames",
         type=int,
-        default=0,
-        help="Only for --mode sv_scene. 0 means keep all entries for each chosen scene.",
+        default=-1,
+        help="truncate MV lists (img_paths/poses/pts_paths/...) to first N frames; <=0 disables",
     )
+    ap.add_argument("--seed", type=int, default=0, help="reserved for future random sampling")
     args = ap.parse_args()
 
-    infos = _load_infos(args.in_pkl)
-    data_list: List[Dict[str, Any]] = infos["data_list"]
-    n = len(data_list)
-    rng = random.Random(int(args.seed))
-    k = int(args.num_scenes)
-    if k <= 0:
-        raise ValueError(f"--num-scenes must be >=1, got {k}")
+    in_path = osp.abspath(osp.expanduser(args.in_path))
+    out_path = osp.abspath(osp.expanduser(args.out_path))
 
-    chosen = []
-    subset: List[Dict[str, Any]] = []
-    subset_meta: Dict[str, Any] = {
-        "in_pkl": os.path.abspath(args.in_pkl),
-        "num_scenes": k,
+    scene_re = re.compile(args.scene_regex) if args.scene_regex else None
+    base = _load_pkl(in_path)
+    data_list: Sequence[Dict[str, Any]] = base["data_list"]
+
+    kept: List[Dict[str, Any]] = []
+    for it in data_list:
+        if not isinstance(it, dict):
+            continue
+        if not _match_scene(it, scene=args.scene, scene_re=scene_re):
+            continue
+        # Optionally truncate MV per-frame lists to make a tiny sample.
+        if int(args.max_frames) > 0 and isinstance(it.get("img_paths", None), list):
+            img_paths = [p for p in it.get("img_paths", []) if isinstance(p, str)]
+            n = min(int(args.max_frames), len(img_paths))
+            if n > 0:
+                it = dict(it)  # shallow copy
+                it["img_paths"] = img_paths[:n]
+                # Common per-frame parallel lists in MV infos.
+                for k in (
+                    "poses",
+                    "pts_paths",
+                    "super_pts_paths",
+                    "pts_instance_mask_paths",
+                    "pts_semantic_mask_paths",
+                ):
+                    v = it.get(k, None)
+                    if isinstance(v, list) and len(v) >= n:
+                        it[k] = v[:n]
+        kept.append(it)
+        if len(kept) >= int(args.max_items):
+            break
+
+    subset_meta = {
+        "source": in_path,
+        "scene": args.scene,
+        "scene_regex": args.scene_regex,
+        "max_items": int(args.max_items),
+        "max_frames": int(args.max_frames),
         "seed": int(args.seed),
-        "mode": str(args.mode),
+        "kept": int(len(kept)),
     }
 
-    if args.mode == "entry":
-        if k > n:
-            raise ValueError(f"--num-scenes must be in [1,{n}] for mode=entry, got {k}")
-        idxs = list(range(n))
-        rng.shuffle(idxs)
-        chosen = sorted(idxs[:k])
-        subset = [data_list[i] for i in chosen]
-        subset_meta["chosen_indices"] = chosen
-    else:
-        # SV pkl is frame-level. Group by ScanNet scene name extracted from img_path:
-        #   2D/scene0613_00/color/3200.jpg -> scene0613_00
-        def _scene_from_img_path(p: str) -> str:
-            if not isinstance(p, str) or not p:
-                return ""
-            parts = p.replace("\\", "/").split("/")
-            # expected: ["2D", "sceneXXXX_YY", "color", ...]
-            if len(parts) >= 2 and parts[1].startswith("scene"):
-                return parts[1]
-            # fallback: find first token like "scene????_??"
-            for token in parts:
-                if token.startswith("scene") and "_" in token:
-                    return token
-            return ""
-
-        scene_to_indices: Dict[str, List[int]] = {}
-        for i, info in enumerate(data_list):
-            scene = _scene_from_img_path(info.get("img_path", ""))
-            if not scene:
-                continue
-            scene_to_indices.setdefault(scene, []).append(i)
-
-        scenes = sorted(scene_to_indices.keys())
-        if k > len(scenes):
-            raise ValueError(f"--num-scenes={k} > available scenes={len(scenes)} in SV pkl")
-
-        scenes_shuf = scenes[:]
-        rng.shuffle(scenes_shuf)
-        chosen_scenes = sorted(scenes_shuf[:k])
-        subset_meta["chosen_scenes"] = chosen_scenes
-
-        max_per = int(args.max_entries_per_scene)
-        for scene in chosen_scenes:
-            idxs = scene_to_indices[scene][:]
-            rng.shuffle(idxs)
-            if max_per > 0:
-                idxs = idxs[:max_per]
-            chosen.extend(sorted(idxs))
-
-        chosen = sorted(set(chosen))
-        subset = [data_list[i] for i in chosen]
-        subset_meta["chosen_indices"] = chosen
-        subset_meta["max_entries_per_scene"] = int(args.max_entries_per_scene)
-
-    out = dict(infos)
-    out["data_list"] = subset
+    out = dict(base)
+    out["data_list"] = kept
     out["subset_meta"] = subset_meta
+    _save_pkl(out_path, out)
 
-    out_dir = os.path.dirname(args.out_pkl)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    with open(args.out_pkl, "wb") as f:
-        pickle.dump(out, f)
+    # Sidecar JSON for quick inspection
+    try:
+        with open(out_path + ".json", "w", encoding="utf-8") as f:
+            json.dump(subset_meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-    with open(args.out_pkl + ".json", "w", encoding="utf-8") as f:
-        json.dump(out["subset_meta"], f, ensure_ascii=False, indent=2)
-
-    print(f"Wrote subset pkl: {args.out_pkl} ({k} mode={args.mode}, entries={len(subset)})")
+    print(f"[subset] in={in_path}")
+    print(f"[subset] out={out_path}")
+    print(f"[subset] kept={len(kept)}")
+    if kept:
+        print(f"[subset] first_img_paths={_extract_rel_img_paths(kept[0])[:3]}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

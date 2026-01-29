@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import pdb, time
+import math
+from typing import Optional
 from mmengine.model import BaseModule
+from mmengine.logging import MMLogger
 from mmdet3d.registry import MODELS
 from torch_scatter import scatter_mean, scatter_add
 from .mixformer3d import MultiScaleQuery
@@ -134,6 +137,137 @@ class FFN(BaseModule):
             z = self.norm(z)
             out.append(z)
         return out
+
+
+def _shift_scale_points(xyz: torch.Tensor, src_range):
+    """Normalize xyz into [0,1] given (min,max) range.
+
+    Args:
+        xyz: (B, N, 3)
+        src_range: (min_xyz, max_xyz) each (B, 1, 3) or (B, 3)
+    """
+    if src_range is None:
+        return xyz
+    src_min, src_max = src_range
+    if src_min.ndim == 2:
+        src_min = src_min.unsqueeze(1)
+    if src_max.ndim == 2:
+        src_max = src_max.unsqueeze(1)
+    scale = (src_max - src_min).clamp(min=1e-6)
+    return (xyz - src_min) / scale
+
+
+class PositionEmbeddingCoordsSine(nn.Module):
+    """Sine positional embedding for 3D coordinates.
+
+    This is a minimal, dependency-free port of SegDINO3D's implementation.
+    """
+
+    def __init__(self, temperature=10000, normalize=True, scale=None, d_pos=256):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.normalize = bool(normalize)
+        self.scale = float(scale) if scale is not None else 2 * math.pi
+        self.d_pos = int(d_pos)
+
+    def forward(self, xyz: torch.Tensor, input_range=None, modulated: Optional[torch.Tensor] = None):
+        # xyz: (B, N, 3)
+        assert xyz.ndim == 3 and xyz.shape[-1] == 3
+        if self.normalize:
+            xyz = _shift_scale_points(xyz, input_range)
+        num_channels = self.d_pos
+
+        ndim = num_channels // 3
+        if ndim % 2 != 0:
+            ndim -= 1
+        rems = num_channels - (ndim * 3)
+        assert ndim % 2 == 0
+
+        final_embeds = []
+        prev_dim = 0
+        for d in range(3):
+            cdim = ndim
+            if rems > 0:
+                cdim += 2
+                rems -= 2
+            if cdim != prev_dim:
+                dim_t = torch.arange(cdim, dtype=torch.float32, device=xyz.device)
+                dim_t = self.temperature ** (2 * (dim_t // 2) / cdim)
+            raw_pos = xyz[:, :, d]
+            raw_pos = raw_pos * self.scale
+            pos = raw_pos[:, :, None] / dim_t
+            pos = torch.stack((pos[:, :, 0::2].sin(), pos[:, :, 1::2].cos()), dim=3).flatten(2)
+            final_embeds.append(pos)
+            prev_dim = cdim
+
+        if modulated is not None:
+            assert isinstance(modulated, torch.Tensor) and modulated.shape == xyz.shape
+            for j in range(3):
+                final_embeds[j] = final_embeds[j] * modulated[:, :, j:j + 1]
+
+        return torch.cat(final_embeds, dim=2)
+
+
+class MLP(nn.Module):
+    """Very simple multi-layer perceptron (FFN)."""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = int(num_layers)
+        h = [hidden_dim] * (self.num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+
+def _safe_quantile_1d(x: torch.Tensor, q: float) -> float:
+    """Quantile helper for small diagnostic tensors.
+
+    Uses sort+index to avoid torch.quantile version differences across envs.
+    """
+    if x.numel() == 0:
+        return 0.0
+    x = x.detach().float().flatten()
+    x_sorted, _ = torch.sort(x)
+    idx = int(round((x_sorted.numel() - 1) * float(q)))
+    idx = max(0, min(idx, x_sorted.numel() - 1))
+    return float(x_sorted[idx].item())
+
+
+def _daca_apply_debug_should_log(cfg: dict, seen: int) -> bool:
+    dbg = cfg.get("apply_debug", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(dbg, dict) or not dbg.get("enable", False):
+        return False
+    log_first = int(dbg.get("log_first", 5))
+    log_every = int(dbg.get("log_every", 200))
+    if seen <= log_first:
+        return True
+    return (seen % max(log_every, 1)) == 0
+
+
+def _daca_apply_debug_extra_stats(cfg: dict) -> bool:
+    dbg = cfg.get("apply_debug", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(dbg, dict):
+        return False
+    return bool(dbg.get("extra_stats", True))
+
+
+def _mean_over_layers(layer_stats, keys):
+    if not layer_stats:
+        return {}
+    out = {}
+    for k in keys:
+        vals = []
+        for d in layer_stats:
+            v = d.get(k, None)
+            if isinstance(v, (int, float)):
+                vals.append(float(v))
+        if vals:
+            out[k] = sum(vals) / float(len(vals))
+    return out
 
 
 class QueryDecoder(BaseModule):
@@ -493,7 +627,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                  d_model, num_semantic_linears, in_channels, share_attn_mlp, share_mask_mlp,
                  cross_attn_mode, mask_pred_mode, temporal_attn=False, bbox_flag=False, 
                  use_query_memory2=False, query_stage=[0],use_track_loss=False, use_temporal_loss=False,
-                 use_decouple=False, use_mot=False, mot_type=None, gdino_daca2d=None, **kwargs):
+                 use_decouple=False, use_mot=False, mot_type=None, gdino_daca2d=None,
+                 box3d_ca3d=None, track_window_stm=None, **kwargs):
         super().__init__(
             num_classes=num_instance_classes, d_model=d_model, in_channels=in_channels,use_track_loss=use_track_loss, **kwargs)
         assert num_semantic_linears in [1, 2]
@@ -565,6 +700,325 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             CrossAttentionLayer(self.d_model, self.num_heads, self.dropout, fix=self.fix_attention)
             for _ in range(len(self.cross_attn_layers))
         ])
+        # Diagnostics: record whether DACA-2D actually changes 3D queries.
+        self._daca_apply_seen = 0
+        self._last_daca2d_apply_stats = None
+
+        # SegDINO3D-style box-modulated CA-3D (optional, default disabled).
+        # This is a lightweight approximation that adds (modulated) 3D positional
+        # embeddings to SP-domain cross-attn inputs (layer0 only by default).
+        self.box3d_ca_cfg = box3d_ca3d or {}
+        self._box3d_ca_enabled = bool(self.box3d_ca_cfg.get('enable', False))
+        if self._box3d_ca_enabled:
+            temperature = float(self.box3d_ca_cfg.get('temperature', 10000.0))
+            self.box3d_pe = PositionEmbeddingCoordsSine(
+                temperature=temperature,
+                normalize=True,
+                d_pos=self.d_model,
+            )
+            self.box3d_ref_point_head = MLP(self.d_model, self.d_model, self.d_model, 2)
+            self.box3d_ref_anchor_head = MLP(self.d_model, self.d_model, 3, 2)
+            self.box3d_qpos_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_model) for _ in range(len(self.cross_attn_layers))])
+            self.box3d_kpos_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_model) for _ in range(len(self.cross_attn_layers))])
+
+        # Track-window STM (decoder-level; disabled by default).
+        # This injects a distance-aware cross-attn from recent track prototypes
+        # (LTM track bank) to current-frame instance queries.
+        self.track_window_stm_cfg = track_window_stm or {}
+        self._trk_stm_enabled = bool(self.track_window_stm_cfg.get("enable", False))
+        # Diagnostic collection flag (set externally, e.g. by model.predict when
+        # online_monitor is enabled). Keep False by default to avoid overhead.
+        self._trk_stm_diag_collect = False
+        self._last_trk_stm_apply_stats = None
+        if self._trk_stm_enabled:
+            self._trk_stm_window = max(int(self.track_window_stm_cfg.get("window", 5)), 1)
+            self._trk_stm_mode = str(self.track_window_stm_cfg.get("mode", "scale")).lower()
+            if self._trk_stm_mode not in ("cross", "distance", "scale"):
+                self._trk_stm_mode = "scale"
+            # Use `dist_lambda` (preferred) or legacy `lambda` (avoid reserved keyword in configs).
+            self._trk_stm_lambda = float(
+                self.track_window_stm_cfg.get("dist_lambda", self.track_window_stm_cfg.get("lambda", 1.0))
+            )
+            # Identity-safe residual gating (recommended for finetune). The STM
+            # branch is randomly initialized when loading old checkpoints, so
+            # gating lets the model start close to baseline and gradually learn
+            # to use track memory.
+            gate_init = float(self.track_window_stm_cfg.get("gate_init", -6.0))  # sigmoid(-6)≈0.0025
+            try:
+                n_layers = int(getattr(self, "num_layers", len(self.cross_attn_layers)))
+            except Exception:
+                n_layers = len(self.cross_attn_layers)
+            n_layers = max(int(n_layers), 1)
+            self._trk_stm_gate = nn.Parameter(torch.full((n_layers,), gate_init, dtype=torch.float32))
+
+            self._trk_stm_norm = nn.LayerNorm(self.d_model)
+            self._trk_stm_dropout = nn.Dropout(self.dropout)
+            self._trk_stm_mha = nn.MultiheadAttention(
+                self.d_model, self.num_heads, dropout=self.dropout, batch_first=True
+            )
+            self._trk_stm_msq = MultiScaleQuery(
+                embed_dims=self.d_model, num_heads=self.num_heads, dropout=self.dropout
+            )
+            try:
+                self._trk_stm_msq.init_weights()
+            except Exception:
+                pass
+
+    def _apply_track_window_stm(self, queries, track_instances, query3d_pos, layer_idx: int = -1):
+        """Apply track-window STM to current-frame queries (per batch element).
+
+        Args:
+            queries: List[Tensor], each (Nq, D)
+            track_instances: Instances with fields queries/bboxes/valid_track/disappear_time
+            query3d_pos: List[Tensor] or Tensor, each (Nq, 3)
+        """
+        if not bool(getattr(self, "_trk_stm_enabled", False)):
+            return queries
+        if track_instances is None or query3d_pos is None:
+            return queries
+
+        if torch.is_tensor(query3d_pos):
+            qpos_list = [query3d_pos]
+        elif isinstance(query3d_pos, (list, tuple)):
+            qpos_list = list(query3d_pos)
+        else:
+            return queries
+
+        if len(qpos_list) < len(queries):
+            return queries
+
+        diag_collect = bool(getattr(self, "_trk_stm_diag_collect", False))
+        layer_stats = None
+        n_valid_batches = 0
+        if diag_collect:
+            layer_stats = {
+                "layer": int(layer_idx),
+                "mode": str(getattr(self, "_trk_stm_mode", "scale")),
+                "window": int(getattr(self, "_trk_stm_window", 1)),
+                "dist_lambda": float(getattr(self, "_trk_stm_lambda", 1.0)),
+                "gate_alpha": 0.0,
+                "mem_tracks_total_mean": 0.0,
+                "mem_tracks_win_mean": 0.0,
+                "applied_q_mean": 0.0,
+                "delta_rel_mean": 0.0,
+                "delta_rel_p50": 0.0,
+                "delta_rel_p90": 0.0,
+                "min_dist_p50": 0.0,
+                "min_dist_p90": 0.0,
+                "delta_nan": 0.0,
+            }
+
+        out = []
+        # Gate (per decoder layer). Use sigmoid so the default init is
+        # near-zero (identity), but remains learnable.
+        try:
+            gate = getattr(self, "_trk_stm_gate", None)
+            if torch.is_tensor(gate) and gate.numel() > 0:
+                idx = int(layer_idx) if int(layer_idx) >= 0 else (int(gate.numel()) - 1)
+                idx = max(0, min(idx, int(gate.numel()) - 1))
+                alpha = gate[idx].sigmoid().to(dtype=queries[0].dtype if queries and torch.is_tensor(queries[0]) else torch.float32)
+            else:
+                alpha = None
+        except Exception:
+            alpha = None
+
+        for b in range(len(queries)):
+            q = queries[b]
+            qpos = qpos_list[b]
+            if not (torch.is_tensor(q) and torch.is_tensor(qpos)):
+                out.append(q)
+                continue
+            if q.numel() == 0 or qpos.numel() == 0:
+                out.append(q)
+                continue
+            if qpos.shape[0] != q.shape[0] or qpos.shape[-1] < 3:
+                out.append(q)
+                continue
+
+            try:
+                trk_q_all = track_instances.queries[b]
+                trk_box_all = track_instances.bboxes[b]
+            except Exception:
+                out.append(q)
+                continue
+
+            if not (torch.is_tensor(trk_q_all) and torch.is_tensor(trk_box_all)):
+                out.append(q)
+                continue
+            if trk_q_all.numel() == 0 or trk_box_all.numel() == 0:
+                out.append(q)
+                continue
+            if trk_box_all.shape[0] != trk_q_all.shape[0]:
+                out.append(q)
+                continue
+
+            try:
+                valid = track_instances.valid_track[b]
+                if not torch.is_tensor(valid):
+                    valid = None
+            except Exception:
+                valid = None
+            if valid is None:
+                valid = torch.ones((trk_q_all.shape[0],), dtype=torch.bool, device=trk_q_all.device)
+            else:
+                valid = valid.to(device=trk_q_all.device)
+
+            try:
+                disp = track_instances.disappear_time[b]
+                if not torch.is_tensor(disp):
+                    disp = None
+            except Exception:
+                disp = None
+            if disp is None:
+                mem_mask = valid
+            else:
+                disp = disp.to(device=trk_q_all.device)
+                mem_mask = valid & (disp <= int(self._trk_stm_window - 1))
+
+            # Optional: memory token dropout (train-time only). This encourages
+            # the model to not overly rely on a few near-by tracks and can help
+            # the STM gate learn to open when memory is informative.
+            try:
+                drop_p = float(self.track_window_stm_cfg.get("mem_dropout", 0.0))
+            except Exception:
+                drop_p = 0.0
+            if bool(getattr(self, "training", False)) and drop_p > 0.0:
+                drop_p = max(0.0, min(drop_p, 0.95))
+                try:
+                    idx = torch.nonzero(mem_mask, as_tuple=True)[0]
+                    if idx.numel() > 1:
+                        keep = torch.rand((idx.numel(),), device=idx.device) > drop_p
+                        if keep.any():
+                            mem_mask = torch.zeros_like(mem_mask)
+                            mem_mask[idx[keep]] = True
+                        else:
+                            # Keep at least one token to avoid degenerate no-op.
+                            j = int(torch.randint(0, idx.numel(), (1,), device=idx.device).item())
+                            mem_mask = torch.zeros_like(mem_mask)
+                            mem_mask[idx[j]] = True
+                except Exception:
+                    pass
+
+            if int(mem_mask.sum().item()) <= 0:
+                out.append(q)
+                continue
+
+            mem_q = trk_q_all[mem_mask].detach()
+            mem_pos = trk_box_all[mem_mask][:, :3].detach()
+            if mem_q.numel() == 0 or mem_pos.numel() == 0:
+                out.append(q)
+                continue
+
+            mode = str(getattr(self, "_trk_stm_mode", "scale")).lower()
+            delta = None
+            delta_nan = False
+            if mode == "cross":
+                attn_out, _ = self._trk_stm_mha(
+                    q.unsqueeze(0),
+                    mem_q.unsqueeze(0),
+                    mem_q.unsqueeze(0),
+                    attn_mask=None,
+                )
+                delta = attn_out.squeeze(0)
+            elif mode == "distance":
+                try:
+                    dist = torch.cdist(qpos[:, :3], mem_pos[:, :3], p=2)
+                    attn_bias = (-dist * float(getattr(self, "_trk_stm_lambda", 1.0))).to(
+                        dtype=q.dtype, device=q.device
+                    )
+                except Exception:
+                    out.append(q)
+                    continue
+                attn_out, _ = self._trk_stm_mha(
+                    q.unsqueeze(0),
+                    mem_q.unsqueeze(0),
+                    mem_q.unsqueeze(0),
+                    attn_mask=attn_bias,
+                )
+                delta = attn_out.squeeze(0)
+            else:  # "scale"
+                lam = float(getattr(self, "_trk_stm_lambda", 1.0))
+                try:
+                    delta = self._trk_stm_msq(
+                        [qpos[:, :3].to(device=q.device, dtype=q.dtype)],
+                        [q],
+                        [mem_q.to(device=q.device, dtype=q.dtype)],
+                        [mem_q.to(device=q.device, dtype=q.dtype)],
+                        [mem_pos[:, :3].to(device=q.device, dtype=q.dtype)],
+                        dist_scale=lam,
+                    )[0]
+                except Exception:
+                    out.append(q)
+                    continue
+
+            if delta is None or (not torch.is_tensor(delta)) or delta.shape != q.shape:
+                out.append(q)
+                continue
+            try:
+                delta_nan = bool(torch.isnan(delta).any().item()) or bool(torch.isinf(delta).any().item())
+            except Exception:
+                delta_nan = False
+
+            # Apply residual gate: q <- q + alpha * delta (alpha≈0 at init).
+            if alpha is None:
+                applied_delta = delta
+                alpha_f = 1.0
+            else:
+                applied_delta = delta * alpha.to(device=q.device, dtype=q.dtype)
+                alpha_f = float(alpha.detach().cpu().item())
+
+            if diag_collect and layer_stats is not None:
+                try:
+                    valid_sum = int(valid.sum().item()) if torch.is_tensor(valid) else int(trk_q_all.shape[0])
+                    win_sum = int(mem_mask.sum().item())
+                    layer_stats["mem_tracks_total_mean"] += float(valid_sum)
+                    layer_stats["mem_tracks_win_mean"] += float(win_sum)
+                    layer_stats["applied_q_mean"] += float(q.shape[0])
+                    layer_stats["gate_alpha"] += float(alpha_f)
+
+                    denom = q.norm(dim=-1).clamp(min=1e-6)
+                    rel = applied_delta.norm(dim=-1) / denom
+                    rel = rel.masked_fill(~torch.isfinite(rel), 0.0)
+                    layer_stats["delta_rel_mean"] += float(rel.mean().item())
+                    layer_stats["delta_rel_p50"] += _safe_quantile_1d(rel, 0.5)
+                    layer_stats["delta_rel_p90"] += _safe_quantile_1d(rel, 0.9)
+
+                    d = torch.cdist(qpos[:, :3], mem_pos[:, :3], p=2)
+                    dmin = d.min(dim=1).values
+                    dmin = dmin.masked_fill(~torch.isfinite(dmin), float("inf"))
+                    layer_stats["min_dist_p50"] += _safe_quantile_1d(dmin, 0.5)
+                    layer_stats["min_dist_p90"] += _safe_quantile_1d(dmin, 0.9)
+
+                    layer_stats["delta_nan"] += 1.0 if delta_nan else 0.0
+                    n_valid_batches += 1
+                except Exception:
+                    pass
+
+            q_new = self._trk_stm_norm(q + self._trk_stm_dropout(applied_delta))
+            out.append(q_new)
+
+        if diag_collect and layer_stats is not None and n_valid_batches > 0:
+            for k in (
+                "gate_alpha",
+                "mem_tracks_total_mean",
+                "mem_tracks_win_mean",
+                "applied_q_mean",
+                "delta_rel_mean",
+                "delta_rel_p50",
+                "delta_rel_p90",
+                "min_dist_p50",
+                "min_dist_p90",
+                "delta_nan",
+            ):
+                layer_stats[k] = float(layer_stats[k]) / float(n_valid_batches)
+            try:
+                if not hasattr(self, "_trk_stm_apply_layer_stats") or self._trk_stm_apply_layer_stats is None:
+                    self._trk_stm_apply_layer_stats = []
+                self._trk_stm_apply_layer_stats.append(layer_stats)
+            except Exception:
+                pass
+
+        return out
     def reset_decouple(self):
         """Reset the decouple module.
         """
@@ -584,6 +1038,99 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         if isinstance(inject_layers, (list, tuple)):
             return layer_idx in inject_layers
         return False
+
+    def _box3d_ca_enabled_for_layer(self, layer_idx: int) -> bool:
+        if not self._box3d_ca_enabled:
+            return False
+        cfg = self.box3d_ca_cfg if isinstance(self.box3d_ca_cfg, dict) else {}
+        layers = cfg.get("layers", [0])
+        if layers == "all":
+            return True
+        if isinstance(layers, (list, tuple, set)):
+            return int(layer_idx) in set(int(x) for x in layers)
+        return int(layer_idx) == 0
+
+    def _apply_box3d_ca3d_sp(self, layer_idx: int, inst_feats, queries, attn_mask,
+                              sp_pos_list_elastic, scene_range,
+                              base_query_pos, ref_sizes_norm):
+        """SegDINO3D-style box-modulated CA on SP-domain (approximation).
+
+        This modulates SP cross-attn by adding (optionally size-modulated) 3D
+        positional embeddings to queries/keys before attention.
+
+        Args are lists (len B). Returns updated queries and updated ref_sizes_norm.
+        """
+        if not self._box3d_ca_enabled_for_layer(layer_idx):
+            return queries, ref_sizes_norm
+        if sp_pos_list_elastic is None or scene_range is None or base_query_pos is None:
+            return queries, ref_sizes_norm
+        if not (isinstance(sp_pos_list_elastic, (list, tuple)) and isinstance(scene_range, (list, tuple)) and isinstance(base_query_pos, (list, tuple))):
+            return queries, ref_sizes_norm
+        if len(sp_pos_list_elastic) < len(queries) or len(scene_range) < len(queries) or len(base_query_pos) < len(queries):
+            return queries, ref_sizes_norm
+
+        cfg = self.box3d_ca_cfg if isinstance(self.box3d_ca_cfg, dict) else {}
+        use_mod = bool(cfg.get("use_modulation", True))
+        eps = float(cfg.get("eps", 1e-6))
+        max_mod = float(cfg.get("max_mod", 50.0))
+
+        out = []
+        for b in range(len(queries)):
+            q = queries[b]
+            k = inst_feats[b]
+            if q.numel() == 0 or k.numel() == 0:
+                out.append(q)
+                continue
+            sp_pos = sp_pos_list_elastic[b]
+            qpos_base = base_query_pos[b]
+            if not (torch.is_tensor(sp_pos) and torch.is_tensor(qpos_base)):
+                out.append(q)
+                continue
+            if sp_pos.shape[0] != k.shape[0]:
+                out.append(q)
+                continue
+            if qpos_base.shape[0] != q.shape[0]:
+                out.append(q)
+                continue
+            smin, smax = scene_range[b]
+            if not (torch.is_tensor(smin) and torch.is_tensor(smax)):
+                out.append(q)
+                continue
+            smin = smin.to(device=q.device, dtype=q.dtype)
+            smax = smax.to(device=q.device, dtype=q.dtype)
+            span = (smax - smin).clamp(min=1e-6)
+
+            # Query sizes in normalized space (for modulation); default to 0.5 if absent.
+            if ref_sizes_norm is None or ref_sizes_norm[b] is None:
+                qsize_n = torch.full_like(qpos_base, 0.5)
+            else:
+                qsize_n = ref_sizes_norm[b].to(device=q.device, dtype=q.dtype)
+                if qsize_n.shape != qpos_base.shape:
+                    qsize_n = torch.full_like(qpos_base, 0.5)
+
+            modulated = None
+            if use_mod:
+                ref = torch.sigmoid(self.box3d_ref_anchor_head(q))  # (nq,3)
+                modulated = (ref / (qsize_n + eps)).clamp(max=max_mod)
+
+            q_pe = self.box3d_pe(qpos_base.unsqueeze(0), input_range=(smin.unsqueeze(0), smax.unsqueeze(0)),
+                                 modulated=modulated.unsqueeze(0) if modulated is not None else None)[0]
+            q_pe = self.box3d_ref_point_head(q_pe)
+            k_pe = self.box3d_pe(sp_pos.unsqueeze(0), input_range=(smin.unsqueeze(0), smax.unsqueeze(0)))[0]
+
+            q_in = q + self.box3d_qpos_proj[layer_idx](q_pe)
+            k_in = k + self.box3d_kpos_proj[layer_idx](k_pe)
+
+            attn = self.cross_attn_layers[layer_idx].attn
+            attn_b = attn_mask[b] if attn_mask is not None else None
+            attn_out, _ = attn(q_in, k_in, k, attn_mask=attn_b)
+            if self.cross_attn_layers[layer_idx].fix:
+                attn_out = self.cross_attn_layers[layer_idx].dropout(attn_out)
+            attn_out = attn_out + q
+            if self.cross_attn_layers[layer_idx].fix:
+                attn_out = self.cross_attn_layers[layer_idx].norm(attn_out)
+            out.append(attn_out)
+        return out, ref_sizes_norm
 
     def _apply_daca2d(self, queries, attn_mask, query2d_feats, query2d_pos,
                        sp_pos_list, cfg, layer_idx: int):
@@ -610,8 +1157,30 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         thr = float(mask_cfg.get("thr", 0.2))
         metric = str(mask_cfg.get("metric", "l1")).lower()
         p = 1 if metric == "l1" else 2
+        extra_stats = _daca_apply_debug_extra_stats(cfg)
 
         outputs = []
+        layer_stats = {
+            "layer": int(layer_idx),
+            "metric": metric,
+            "thr": float(thr),
+            "delta_rel_mean": 0.0,
+            "allowed_q2d_mean": 0.0,
+            "allowed_q2d_zero_rate": 0.0,
+            "allowed_q2d_p50": 0.0,
+            "allowed_q2d_p90": 0.0,
+            "nq3d_mean": 0.0,
+            "nq2d_mean": 0.0,
+            "sp_allow_mean": 0.0,
+            "sp_allow_p50": 0.0,
+            "sp_allow_p90": 0.0,
+            "min_dist_q3d_p50": 0.0,
+            "min_dist_q3d_p90": 0.0,
+            "min_dist_q2d_p50": 0.0,
+            "min_dist_q2d_p90": 0.0,
+            "q2d_any_sp_rate": 0.0,
+        }
+        n_valid_batches = 0
         for b in range(len(queries)):
             attn_b = attn_mask[b]
             sp_pos = sp_pos_list[b]
@@ -634,13 +1203,83 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             dist = torch.cdist(sp_pos, q2d_pos, p=p)
             reach = (~attn_b).float() @ (dist < thr).float()
             daca_mask = (reach == 0)
+            # Diagnostic: how many 2D queries are reachable per 3D query (before dummy append).
+            try:
+                allowed = (~daca_mask).sum(dim=1).float()  # (Nq3d,)
+                layer_stats["allowed_q2d_mean"] += float(allowed.mean().item())
+                layer_stats["allowed_q2d_zero_rate"] += float((allowed == 0).float().mean().item())
+                layer_stats["allowed_q2d_p50"] += _safe_quantile_1d(allowed, 0.5)
+                layer_stats["allowed_q2d_p90"] += _safe_quantile_1d(allowed, 0.9)
+                layer_stats["nq3d_mean"] += float(attn_b.shape[0])
+                layer_stats["nq2d_mean"] += float(q2d.shape[0])
+                if extra_stats:
+                    sp_allow = (~attn_b).sum(dim=1).float()  # (Nq3d,)
+                    layer_stats["sp_allow_mean"] += float(sp_allow.mean().item())
+                    layer_stats["sp_allow_p50"] += _safe_quantile_1d(sp_allow, 0.5)
+                    layer_stats["sp_allow_p90"] += _safe_quantile_1d(sp_allow, 0.9)
+
+                    # For each 3D query: min dist to any 2D query among its allowed SPs (approx).
+                    # 1) per-SP min dist to any q2d
+                    dist_sp_min = dist.min(dim=1).values  # (Nsp,)
+                    # 2) per-q3d min over allowed SPs
+                    allowed_sp = ~attn_b  # (Nq3d, Nsp)
+                    masked = dist_sp_min.unsqueeze(0).expand_as(allowed_sp.float())
+                    masked = masked.masked_fill(~allowed_sp, float("inf"))
+                    min_dist_q3d = masked.min(dim=1).values
+                    min_dist_q3d = min_dist_q3d.masked_fill(~torch.isfinite(min_dist_q3d), float("inf"))
+                    layer_stats["min_dist_q3d_p50"] += _safe_quantile_1d(min_dist_q3d, 0.5)
+                    layer_stats["min_dist_q3d_p90"] += _safe_quantile_1d(min_dist_q3d, 0.9)
+
+                    # For each 2D query: min dist to any SP (global, independent of attn mask)
+                    dist_q2d_min = dist.min(dim=0).values  # (Nq2d,)
+                    layer_stats["min_dist_q2d_p50"] += _safe_quantile_1d(dist_q2d_min, 0.5)
+                    layer_stats["min_dist_q2d_p90"] += _safe_quantile_1d(dist_q2d_min, 0.9)
+                    layer_stats["q2d_any_sp_rate"] += float((dist_q2d_min < thr).float().mean().item())
+                n_valid_batches += 1
+            except Exception:
+                pass
             # Append dummy query to avoid empty attention rows (SegDINO3D style)
             q2d = torch.cat([q2d, q2d.new_ones(1, q2d.shape[1])], dim=0)
             daca_mask = torch.cat([daca_mask, daca_mask.new_zeros(daca_mask.shape[0], 1)], dim=1)
 
-            out_b = self.dino_query_cross_attn_layers[layer_idx]([q2d], [queries[b]], [daca_mask])[0]
+            q3d_in = queries[b]
+            out_b = self.dino_query_cross_attn_layers[layer_idx]([q2d], [q3d_in], [daca_mask])[0]
+            # Diagnostic: relative change magnitude (||delta|| / ||q||).
+            try:
+                delta = out_b - q3d_in
+                denom = q3d_in.norm(dim=-1).mean().clamp(min=1e-6)
+                rel = delta.norm(dim=-1).mean() / denom
+                layer_stats["delta_rel_mean"] += float(rel.item())
+            except Exception:
+                pass
             outputs.append(out_b)
 
+        if n_valid_batches > 0:
+            for k in (
+                "delta_rel_mean",
+                "allowed_q2d_mean",
+                "allowed_q2d_zero_rate",
+                "allowed_q2d_p50",
+                "allowed_q2d_p90",
+                "nq3d_mean",
+                "nq2d_mean",
+                "sp_allow_mean",
+                "sp_allow_p50",
+                "sp_allow_p90",
+                "min_dist_q3d_p50",
+                "min_dist_q3d_p90",
+                "min_dist_q2d_p50",
+                "min_dist_q2d_p90",
+                "q2d_any_sp_rate",
+            ):
+                layer_stats[k] = float(layer_stats[k]) / float(n_valid_batches)
+        # Stash per-layer stats for the outer forward to aggregate/log.
+        try:
+            if not hasattr(self, "_daca_apply_layer_stats") or self._daca_apply_layer_stats is None:
+                self._daca_apply_layer_stats = []
+            self._daca_apply_layer_stats.append(layer_stats)
+        except Exception:
+            pass
         return outputs
     
     def reset_query_memory2(self):
@@ -710,7 +1349,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
     def forward_iter_pred(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
                           inst_dict=None, track_instances=None, use_one2many=False,
                           query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None,
-                          sp_pos_list_override=None):
+                          sp_pos_list_override=None,
+                          sp_pos_list_elastic=None, scene_range=None, query3d_pos=None):
         """Iterative forward pass.
         
         Args:
@@ -723,6 +1363,10 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             Dict: with instance scores, semantic scores, masks, scores,
                 and aux_outputs.
         """
+        # Note: sp_pos_list_elastic/scene_range/query3d_pos are reserved for
+        # SegDINO3D-style box-modulated CA-3D. They are accepted here for
+        # forward-compatibility and are no-ops unless the corresponding feature
+        # is enabled in this decoder.
         cls_preds, sem_preds, pred_scores, pred_masks = [], [], [], []
         object_queries, pred_bboxes = [], []
         inst_feats = [self.input_proj(y) for y in sp_feats] if "SP" in self.cross_attn_mode else None # [N_segments, 96] -> [N_segments, 256]
@@ -756,10 +1400,38 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         mask_pts_feats = [self.x_mask(y) if self.share_mask_mlp else self.x_pts_mask(y)
              for y in p_feats] if "P" in self.mask_pred_mode else None # [20000, 99] -> [20000, 256]
         queries = self._get_queries(queries, len(sp_feats)) # [N_segments, 96] -> [N_segments, 256] # ! 这个和inst_feats差不多？
+
+        # Reset per-forward track-window STM stats when diagnostics are enabled.
+        if bool(getattr(self, "_trk_stm_enabled", False)) and bool(getattr(self, "_trk_stm_diag_collect", False)):
+            try:
+                self._trk_stm_apply_layer_stats = []
+            except Exception:
+                pass
+
+        # Box-modulated CA-3D bookkeeping (SegDINO3D-style, optional).
+        # qpos_ref_list/qsize_ref_norm are updated per-layer from current bbox predictions.
+        qpos_base_list = None
+        qpos_ref_list = None
+        qsize_ref_norm = None
+        if self._box3d_ca_enabled and isinstance(scene_range, (list, tuple)) and query3d_pos is not None:
+            if torch.is_tensor(query3d_pos):
+                qpos_base_list = [query3d_pos]
+            else:
+                qpos_base_list = list(query3d_pos) if isinstance(query3d_pos, (list, tuple)) else None
+            if qpos_base_list is not None:
+                qpos_ref_list = list(qpos_base_list)
+                qsize_ref_norm = []
+                for b in range(len(queries)):
+                    if b >= len(qpos_ref_list) or not torch.is_tensor(qpos_ref_list[b]):
+                        qsize_ref_norm.append(None)
+                        continue
+                    qsize_ref_norm.append(torch.full_like(qpos_ref_list[b], 0.5))
         # Resolve GDINO DACA-2D config (optional, default disabled)
         gdino_cfg = gdino_daca2d_cfg or self.gdino_daca2d_cfg or {}
         use_daca2d = bool(gdino_cfg.get("enable", False)) and query2d_feats is not None and query2d_pos is not None
         if use_daca2d:
+            # Reset per-forward stats container (avoid cross-iter accumulation).
+            self._daca_apply_layer_stats = []
             # Normalize query2d inputs into per-batch lists.
             if torch.is_tensor(query2d_feats):
                 query2d_feats = [query2d_feats]
@@ -809,7 +1481,16 @@ class ScanNetMixQueryDecoder(QueryDecoder):
 
         for i in range(len(self.cross_attn_layers)): # 3 [queries查询inst_feats] [queries查询inst_feats] [queries查询inst_feats]
             if self.cross_attn_mode[i+1] == "SP" and self.mask_pred_mode[i] == "SP": # SP 内的attention，使用mask
-                queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask) # K Q mask [N_segments, 256], [N_segments, 256], [N_segments, N_segments] -> [N_segments, 256]
+                if self._box3d_ca_enabled and qpos_ref_list is not None and qsize_ref_norm is not None:
+                    queries, _ = self._apply_box3d_ca3d_sp(
+                        i, inst_feats, queries, attn_mask,
+                        sp_pos_list_elastic=sp_pos_list_elastic,
+                        scene_range=scene_range,
+                        base_query_pos=qpos_ref_list,
+                        ref_sizes_norm=qsize_ref_norm,
+                    )
+                else:
+                    queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask) # K Q mask [N_segments, 256], [N_segments, 256], [N_segments, N_segments] -> [N_segments, 256]
                 if use_one2many:
                     one2many_queries = self.cross_attn_layers[i](inst_feats, one2many_queries, one2many_attn_mask)
             elif self.cross_attn_mode[i+1] == "SP" and self.mask_pred_mode[i] == "P":   # current method, change P mask to SP
@@ -838,7 +1519,16 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                     for j in range(len(attn_mask)):
                         if attn_mask[j].shape[1] != inst_feats[j].shape[0]:
                             attn_mask[j] = torch.cat([attn_mask[j], torch.zeros(attn_mask[j].shape[0], inst_feats[j].shape[0] - attn_mask[j].shape[1], device=attn_mask[j].device).bool()], dim=1)
-                queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
+                if self._box3d_ca_enabled and qpos_ref_list is not None and qsize_ref_norm is not None:
+                    queries, _ = self._apply_box3d_ca3d_sp(
+                        i, inst_feats, queries, attn_mask,
+                        sp_pos_list_elastic=sp_pos_list_elastic,
+                        scene_range=scene_range,
+                        base_query_pos=qpos_ref_list,
+                        ref_sizes_norm=qsize_ref_norm,
+                    )
+                else:
+                    queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
                 if use_one2many:
                     one2many_xyz_weights = torch.chunk(super_points[1], len(super_points[0]), dim=0) # torch.chunk(input, chunks, dim=0) 会把输入的张量 input 按照指定的维度 dim 和指定的分块数 chunks 来分割。
                     one2many_attn_mask_score = [scatter_mean(att.float() * xyz_w.view(1, -1), sp, dim=1) # [20000, 1]
@@ -856,6 +1546,11 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                 queries = self.cross_attn_layers[i](inst_pts_feats, queries, attn_mask)
             else:
                 raise NotImplementedError("Not support yet!")
+
+            # Optional: Track-window STM injection (after SP cross-attn, before self-attn).
+            # This is a no-op unless enabled in config and `track_instances` is provided.
+            if bool(getattr(self, "_trk_stm_enabled", False)) and track_instances is not None and query3d_pos is not None:
+                queries = self._apply_track_window_stm(queries, track_instances, query3d_pos, layer_idx=i)
 
             # Optional: DACA-2D injection (paper order = before self-attn)
             if use_daca2d and gdino_cfg.get("order", "paper") == "paper":
@@ -910,6 +1605,108 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             pred_masks.append(pred_mask)
             object_queries.append(object_query)
             pred_bboxes.append(pred_bbox)
+
+            # Update reference qpos/qsize for box-modulated CA-3D (next layer).
+            if self._box3d_ca_enabled and qpos_base_list is not None and qpos_ref_list is not None and qsize_ref_norm is not None:
+                try:
+                    for b in range(len(queries)):
+                        pb = pred_bbox[b] if isinstance(pred_bbox, (list, tuple)) and b < len(pred_bbox) else None
+                        if pb is None or (not torch.is_tensor(pb)):
+                            continue
+                        if b >= len(qpos_base_list) or (not torch.is_tensor(qpos_base_list[b])):
+                            continue
+                        # Reference centers: base_pos + current predicted offset (avoid accumulation drift).
+                        qpos_ref_list[b] = (qpos_base_list[b].to(pb.device, pb.dtype) + pb[:, :3]).detach()
+                        # Reference sizes in normalized space (for modulation).
+                        if isinstance(scene_range, (list, tuple)) and b < len(scene_range):
+                            smin, smax = scene_range[b]
+                            if torch.is_tensor(smin) and torch.is_tensor(smax):
+                                span = (smax.to(pb.device, pb.dtype) - smin.to(pb.device, pb.dtype)).clamp(min=1e-6)
+                                qsize_ref_norm[b] = (pb[:, 3:6] / span).clamp(min=1e-4, max=10.0).detach()
+                except Exception:
+                    pass
+
+        # Aggregate per-layer DACA-2D apply stats (diagnostics for "is it a no-op?")
+        if use_daca2d:
+            try:
+                self._daca_apply_seen = int(getattr(self, "_daca_apply_seen", 0)) + 1
+                layer_stats = getattr(self, "_daca_apply_layer_stats", []) or []
+                keys = (
+                    "delta_rel_mean",
+                    "allowed_q2d_mean",
+                    "allowed_q2d_zero_rate",
+                    "allowed_q2d_p50",
+                    "allowed_q2d_p90",
+                    "nq3d_mean",
+                    "nq2d_mean",
+                    "sp_allow_mean",
+                    "sp_allow_p50",
+                    "sp_allow_p90",
+                    "min_dist_q3d_p50",
+                    "min_dist_q3d_p90",
+                    "min_dist_q2d_p50",
+                    "min_dist_q2d_p90",
+                    "q2d_any_sp_rate",
+                )
+                agg = _mean_over_layers(layer_stats, keys)
+                self._last_daca2d_apply_stats = {
+                    "seen": int(self._daca_apply_seen),
+                    "layers_with_stats": int(len(layer_stats)),
+                    "agg": agg,
+                    "per_layer": layer_stats,
+                }
+                if _daca_apply_debug_should_log(gdino_cfg, int(self._daca_apply_seen)):
+                    logger = MMLogger.get_current_instance()
+                    if logger is not None:
+                        logger.info(
+                            "[GDINO][daca2d][apply] seen=%d layers=%d delta_rel=%.4g allowed_q2d_mean=%.3f "
+                            "allowed_zero=%.3f allowed_p50=%.3f allowed_p90=%.3f nq2d=%.1f nq3d=%.1f "
+                            "sp_allow_p50=%.1f min_dist_q3d_p50=%.3f q2d_any_sp=%.3f",
+                            int(self._daca_apply_seen),
+                            int(len(layer_stats)),
+                            float(agg.get("delta_rel_mean", 0.0)),
+                            float(agg.get("allowed_q2d_mean", 0.0)),
+                            float(agg.get("allowed_q2d_zero_rate", 0.0)),
+                            float(agg.get("allowed_q2d_p50", 0.0)),
+                            float(agg.get("allowed_q2d_p90", 0.0)),
+                            float(agg.get("nq2d_mean", 0.0)),
+                            float(agg.get("nq3d_mean", 0.0)),
+                            float(agg.get("sp_allow_p50", 0.0)),
+                            float(agg.get("min_dist_q3d_p50", 0.0)),
+                            float(agg.get("q2d_any_sp_rate", 0.0)),
+                        )
+            except Exception:
+                pass
+
+        # Aggregate per-layer track-window STM apply stats (diagnostics for "is it a no-op?")
+        if bool(getattr(self, "_trk_stm_enabled", False)) and bool(getattr(self, "_trk_stm_diag_collect", False)):
+            try:
+                layer_stats = getattr(self, "_trk_stm_apply_layer_stats", []) or []
+                keys = (
+                    "gate_alpha",
+                    "mem_tracks_total_mean",
+                    "mem_tracks_win_mean",
+                    "applied_q_mean",
+                    "delta_rel_mean",
+                    "delta_rel_p50",
+                    "delta_rel_p90",
+                    "min_dist_p50",
+                    "min_dist_p90",
+                    "delta_nan",
+                )
+                agg = _mean_over_layers(layer_stats, keys)
+                self._last_trk_stm_apply_stats = {
+                    "enabled": True,
+                    "mode": str(getattr(self, "_trk_stm_mode", "scale")),
+                    "window": int(getattr(self, "_trk_stm_window", 1)),
+                    "dist_lambda": float(getattr(self, "_trk_stm_lambda", 1.0)),
+                    "gate_init": float(self.track_window_stm_cfg.get("gate_init", -6.0)),
+                    "layers_with_stats": int(len(layer_stats)),
+                    "agg": agg,
+                    "per_layer": layer_stats,
+                }
+            except Exception:
+                self._last_trk_stm_apply_stats = None
         
         neq_sum_list = []
         for cls_pred in cls_preds[:-1]:
@@ -959,7 +1756,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
     def forward(self, sp_feats, p_feats, queries, super_points, prev_queries=None, use_temporal_loss=False,
                 inst_dict=False, track_instances=None, use_one2many=False,
                 query2d_feats=None, query2d_pos=None, gdino_daca2d_cfg=None,
-                sp_pos_list_override=None):
+                sp_pos_list_override=None,
+                sp_pos_list_elastic=None, scene_range=None, query3d_pos=None):
         """Forward pass.
         
         Args:
@@ -978,7 +1776,10 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                 track_instances=track_instances, use_one2many=use_one2many,
                 query2d_feats=query2d_feats, query2d_pos=query2d_pos,
                 gdino_daca2d_cfg=gdino_daca2d_cfg,
-                sp_pos_list_override=sp_pos_list_override)
+                sp_pos_list_override=sp_pos_list_override,
+                sp_pos_list_elastic=sp_pos_list_elastic,
+                scene_range=scene_range,
+                query3d_pos=query3d_pos)
         else:
             raise NotImplementedError("No simple forward!!!")
 

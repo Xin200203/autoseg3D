@@ -110,6 +110,15 @@ model = dict(
         use_decouple=use_decouple,
         use_mot=use_mot,
         mot_type=mot_type,
+        # Track-window STM (disabled by default; should not affect baseline).
+        # When enabled, decoder injects a distance-aware cross-attn from
+        # recent track prototypes (LTM track bank) to current-frame queries.
+        track_window_stm=dict(
+            enable=False,
+            window=5,
+            mode='scale',  # 'cross' | 'distance' | 'scale'
+            dist_lambda=1.0,
+        ),
         
         num_layers=3,
         share_attn_mlp=False,

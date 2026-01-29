@@ -9,9 +9,9 @@ model = dict(
         # Enable sparse-FPN injection in MinkUNet decoder (expects [s1,s2,s4,s8,s16] with C=256).
         dino_dim=256,
         config=dict(
-            # Keep default non-strict by default for ablation; can be tightened once stable.
-            dino_strict=False,
-            dino_min_hit_ratio=0.05,
+            # Multi-scale projection alignment must be strict for reliable ablation.
+            dino_strict=True,
+            dino_min_hit_ratio=0.95,
             dino_residual=True,
         ),
     ),
@@ -27,8 +27,25 @@ model = dict(
         backbone_only=True,
         max_depth=10.0,
         align_corners=False,
-        strict=False,
+        strict=True,
         strict_valid_ratio=0.95,
         log_fail=True,
     ),
 )
+
+# Keep training schedule identical to SV baseline except `val_interval`.
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=8)
+
+# Checkpoint: only keep latest + best AP50 (matches baseline intent; avoids per-epoch clutter).
+default_hooks = dict(
+    timer=dict(type='IterTimerHook'),
+    logger=dict(type='LoggerHook', interval=50),
+    param_scheduler=dict(type='ParamSchedulerHook'),
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=1,
+        max_keep_ckpts=1,
+        save_best='all_ap_50%',
+        rule='greater'),
+    sampler_seed=dict(type='DistSamplerSeedHook'),
+    visualization=dict(type='Det3DVisualizationHook'))

@@ -42,6 +42,7 @@ class UnifiedSegMetric(SegMetric):
                               ('all_ap', 'all_ap_50%', 'all_ap_25%'), 
                               ('pq',)],
                  online_monitor: Optional[dict] = None,
+                 cat_agnostic: Optional[bool] = None,
                  **kwargs):
         self.thing_class_inds = thing_class_inds
         self.stuff_class_inds = stuff_class_inds
@@ -53,6 +54,11 @@ class UnifiedSegMetric(SegMetric):
         self.sem_mapping = np.array(sem_mapping)
         self.inst_mapping = np.array(inst_mapping)
         self.online_monitor = online_monitor or {}
+        # Explicit instance evaluation mode:
+        # - True: always category-agnostic instance AP ("object" only)
+        # - False: always category-aware instance AP (ScanNet200 198 thing classes)
+        # - None: legacy heuristic fallback (backward compatible)
+        self.cat_agnostic = cat_agnostic
         super().__init__(**kwargs)
 
     @staticmethod
@@ -192,12 +198,69 @@ class UnifiedSegMetric(SegMetric):
         scene_best_01_05 = _collect_scene("scene_gt_dup.best_iou.btw0p1_0p5")
         scene_mult01_ge2 = _collect_scene("scene_gt_dup.iou01.hit_ge2")
 
+        # Pred-side quality (per predicted instance, best-matched GT)
+        scene_pred_iou_p50 = _collect_scene("scene_gt_dup.pred_quality.best_iou.p50")
+        scene_pred_iou_p90 = _collect_scene("scene_gt_dup.pred_quality.best_iou.p90")
+        scene_pred_pur_p50 = _collect_scene("scene_gt_dup.pred_quality.best_purity.p50")
+        scene_pred_pur_p90 = _collect_scene("scene_gt_dup.pred_quality.best_purity.p90")
+        scene_pred_cov_p50 = _collect_scene("scene_gt_dup.pred_quality.best_coverage.p50")
+        scene_pred_cov_p90 = _collect_scene("scene_gt_dup.pred_quality.best_coverage.p90")
+        scene_pred_useful = _collect_scene("scene_gt_dup.pred_quality.useful_rate")
+        scene_pred_iou_ge05 = _collect_scene("scene_gt_dup.pred_quality.best_iou_ge0p5_rate")
+        scene_pred_cov_ge05 = _collect_scene("scene_gt_dup.pred_quality.best_cov_ge0p5_rate")
+        scene_pred_pur_ge085 = _collect_scene("scene_gt_dup.pred_quality.best_purity_ge0p85_rate")
+
+        # Score-IoU calibration diagnostics (per predicted instance, aligned with instance_scores).
+        scene_score_pear = _collect_scene("scene_gt_dup.score_iou.pearson")
+        scene_score_spear = _collect_scene("scene_gt_dup.score_iou.spearman")
+        scene_score_top20_low_iou = _collect_scene("scene_gt_dup.score_iou.top20_low_iou_rate")
+        scene_score_top20_low_cov = _collect_scene("scene_gt_dup.score_iou.top20_low_cov_rate")
+        scene_or_rank_med = _collect_scene("scene_gt_dup.oracle_rank.median")
+        scene_or_rank_p90 = _collect_scene("scene_gt_dup.oracle_rank.p90")
+        scene_or_rank_gt20 = _collect_scene("scene_gt_dup.oracle_rank.gt_rank_gt20_rate")
+        scene_or_rank_gt50 = _collect_scene("scene_gt_dup.oracle_rank.gt_rank_gt50_rate")
+        scene_or_k20 = _collect_scene("scene_gt_dup.oracle_at_k.K20")
+        scene_or_k50 = _collect_scene("scene_gt_dup.oracle_at_k.K50")
+        scene_or_k100 = _collect_scene("scene_gt_dup.oracle_at_k.K100")
+
         assoc_birth_mean_scene = _collect_scene("scene_assoc_summary.birth_mean")
         assoc_birth_sum_scene = _collect_scene("scene_assoc_summary.birth_sum")
         assoc_track_after_mean_scene = _collect_scene("scene_assoc_summary.track_after_mean")
         inflation_scene = _collect_scene("scene_assoc_summary.inflation")
 
+        # `gdino` stats may be recorded per-frame with either:
+        # - legacy key: gdino.valid_ratio
+        # - current keys: gdino.valid_ratio_mean / gdino.valid_ratio_min
+        gdino_valid_mean = _collect("gdino.valid_ratio_mean")
+        gdino_valid_min = _collect("gdino.valid_ratio_min")
         gdino_valid = _collect("gdino.valid_ratio")
+        if gdino_valid_mean.size == 0 and gdino_valid.size > 0:
+            gdino_valid_mean = gdino_valid
+
+        daca_allowed_zero = _collect("daca2d_apply.allowed_zero_rate")
+        daca_allowed_mean = _collect("daca2d_apply.allowed_q2d_mean")
+        daca_density = _collect("daca2d_apply.density")
+        daca_nq2d = _collect("daca2d_apply.nq2d")
+        daca_nq3d = _collect("daca2d_apply.nq3d")
+        daca_delta = _collect("daca2d_apply.delta_rel_mean")
+        daca_q2d_any_sp = _collect("daca2d_apply.q2d_any_sp_rate")
+
+        # Track-window STM apply stats (decoder-side; aggregated across decoder layers).
+        trk_gate = _collect("trk_stm_apply.agg.gate_alpha")
+        trk_mem_total = _collect("trk_stm_apply.agg.mem_tracks_total_mean")
+        trk_mem_win = _collect("trk_stm_apply.agg.mem_tracks_win_mean")
+        trk_applied_q = _collect("trk_stm_apply.agg.applied_q_mean")
+        trk_delta_mean = _collect("trk_stm_apply.agg.delta_rel_mean")
+        trk_delta_p50 = _collect("trk_stm_apply.agg.delta_rel_p50")
+        trk_delta_p90 = _collect("trk_stm_apply.agg.delta_rel_p90")
+        trk_mind_p50 = _collect("trk_stm_apply.agg.min_dist_p50")
+        trk_mind_p90 = _collect("trk_stm_apply.agg.min_dist_p90")
+        trk_delta_nan = _collect("trk_stm_apply.agg.delta_nan")
+        trk_layers = _collect("trk_stm_apply.layers_with_stats")
+        trk_window = _collect("trk_stm_apply.window")
+        trk_lambda = _collect("trk_stm_apply.dist_lambda")
+        trk_mode = _collect_str("trk_stm_apply.mode")
+
         gdino_pose = _collect_str("gdino.pose_mode")
         gdino_skip = _collect_str("gdino.skipped")
         pose_counts = {}
@@ -228,9 +291,35 @@ class UnifiedSegMetric(SegMetric):
                 "merge_drop": _pack(sp_merge_drop),
             },
             "gdino": {
-                "valid_ratio": _pack(gdino_valid),
+                "valid_ratio_mean": _pack(gdino_valid_mean),
+                "valid_ratio_min": _pack(gdino_valid_min),
                 "pose_mode_counts": pose_counts,
                 "skipped_counts": skip_counts,
+            },
+            "daca2d_apply": {
+                "allowed_zero_rate": _pack(daca_allowed_zero),
+                "allowed_q2d_mean": _pack(daca_allowed_mean),
+                "density": _pack(daca_density),
+                "nq2d": _pack(daca_nq2d),
+                "nq3d": _pack(daca_nq3d),
+                "delta_rel_mean": _pack(daca_delta),
+                "q2d_any_sp_rate": _pack(daca_q2d_any_sp),
+            },
+            "trk_stm_apply": {
+                "gate_alpha": _pack(trk_gate),
+                "mem_tracks_total_mean": _pack(trk_mem_total),
+                "mem_tracks_win_mean": _pack(trk_mem_win),
+                "applied_q_mean": _pack(trk_applied_q),
+                "delta_rel_mean": _pack(trk_delta_mean),
+                "delta_rel_p50": _pack(trk_delta_p50),
+                "delta_rel_p90": _pack(trk_delta_p90),
+                "min_dist_p50": _pack(trk_mind_p50),
+                "min_dist_p90": _pack(trk_mind_p90),
+                "delta_nan": _pack(trk_delta_nan),
+                "layers_with_stats": _pack(trk_layers),
+                "window": _pack(trk_window),
+                "dist_lambda": _pack(trk_lambda),
+                "mode_counts": {m: int(trk_mode.count(m)) for m in set(trk_mode)} if len(trk_mode) > 0 else {},
             },
             "scene_gt_dup": {
                 "n_gt": _pack(scene_ngt),
@@ -246,6 +335,35 @@ class UnifiedSegMetric(SegMetric):
                 "best_iou": {
                     "btw0p1_0p5": _pack(scene_best_01_05),
                 },
+                "pred_quality": {
+                    "best_iou_p50": _pack(scene_pred_iou_p50),
+                    "best_iou_p90": _pack(scene_pred_iou_p90),
+                    "best_purity_p50": _pack(scene_pred_pur_p50),
+                    "best_purity_p90": _pack(scene_pred_pur_p90),
+                    "best_coverage_p50": _pack(scene_pred_cov_p50),
+                    "best_coverage_p90": _pack(scene_pred_cov_p90),
+                    "useful_rate": _pack(scene_pred_useful),
+                    "best_iou_ge0p5_rate": _pack(scene_pred_iou_ge05),
+                    "best_cov_ge0p5_rate": _pack(scene_pred_cov_ge05),
+                    "best_purity_ge0p85_rate": _pack(scene_pred_pur_ge085),
+                },
+                "score_iou": {
+                    "pearson": _pack(scene_score_pear),
+                    "spearman": _pack(scene_score_spear),
+                    "top20_low_iou_rate": _pack(scene_score_top20_low_iou),
+                    "top20_low_cov_rate": _pack(scene_score_top20_low_cov),
+                },
+                "oracle_rank": {
+                    "median": _pack(scene_or_rank_med),
+                    "p90": _pack(scene_or_rank_p90),
+                    "gt_rank_gt20_rate": _pack(scene_or_rank_gt20),
+                    "gt_rank_gt50_rate": _pack(scene_or_rank_gt50),
+                },
+                "oracle_at_k": {
+                    "K20": _pack(scene_or_k20),
+                    "K50": _pack(scene_or_k50),
+                    "K100": _pack(scene_or_k100),
+                },
             },
             "derived": {
                 "corr_dup01_ge2_birth_mean": float(np.corrcoef(scene_mult01_ge2, assoc_birth_mean_scene)[0, 1]) if scene_mult01_ge2.size >= 2 and assoc_birth_mean_scene.size == scene_mult01_ge2.size else 0.0,
@@ -259,6 +377,7 @@ class UnifiedSegMetric(SegMetric):
     def _compute_scene_gt_dup(
         gt_inst: torch.Tensor,
         pred_inst: torch.Tensor,
+        pred_scores: Optional[torch.Tensor] = None,
         min_gt_points: int = 100,
         iou_thr: float = 0.5,
         iou_lo_thr: float = 0.1,
@@ -276,12 +395,25 @@ class UnifiedSegMetric(SegMetric):
         # GT is always per-point ids; pred may be either per-point ids or [P, N] boolean masks.
         gt = gt_inst.detach().to("cpu", dtype=torch.long).flatten()
 
+        pred_scores_cpu: Optional[torch.Tensor] = None
+
         if pred_inst.dim() == 2:
             pred_masks = pred_inst.detach().to("cpu").bool()
             if pred_masks.shape[1] != gt.shape[0]:
                 return None
             pred_sizes = pred_masks.sum(1).to(dtype=torch.float32)
             keep_pred = pred_sizes > 0
+            # Align per-instance scores with kept non-empty masks (if provided).
+            if pred_scores is not None:
+                try:
+                    ps = pred_scores.detach().to("cpu", dtype=torch.float32).flatten()
+                    if int(ps.numel()) == int(keep_pred.numel()):
+                        ps = ps[keep_pred]
+                        pred_scores_cpu = ps
+                    elif int(ps.numel()) == int(pred_masks.shape[0]):
+                        pred_scores_cpu = ps
+                except Exception:
+                    pred_scores_cpu = None
             pred_masks = pred_masks[keep_pred]
             pred_sizes = pred_sizes[keep_pred]
             P = int(pred_masks.shape[0])
@@ -340,6 +472,15 @@ class UnifiedSegMetric(SegMetric):
                 "iou01": {"hit0": 1.0, "hit_ge2": 0.0, "mean_mult": 0.0, "hit1": 0.0, "hit_ge3": 0.0},
                 "best_iou": {"eq0": 1.0, "lt0p1": 0.0, "btw0p1_0p5": 0.0, "ge0p5": 0.0},
                 "mult_iou01": {"hit0": 1.0, "hit1": 0.0, "hit2": 0.0, "hit3p": 0.0},
+                "pred_quality": {
+                    "best_iou": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                    "best_purity": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                    "best_coverage": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                    "useful_rate": 0.0,
+                    "best_iou_ge0p5_rate": 0.0,
+                    "best_cov_ge0p5_rate": 0.0,
+                    "best_purity_ge0p85_rate": 0.0,
+                },
             }
 
         iou = torch.zeros((P, G), dtype=torch.float32)
@@ -383,6 +524,95 @@ class UnifiedSegMetric(SegMetric):
         mult_hit2 = float((hit01 == 2).float().mean().item()) if hit01.numel() else 0.0
         mult_hit3p = float((hit01 >= 3).float().mean().item()) if hit01.numel() else 0.0
 
+        # Pred-side quality summary: purity/coverage/best-iou for each predicted instance (best-matched GT).
+        try:
+            best_iou_pred, best_g = iou.max(1)
+            best_inter = inter.gather(1, best_g.view(-1, 1)).squeeze(1)
+            best_purity_pred = best_inter / (pred_sizes.to(best_inter.device) + 1e-6)
+            best_cov_pred = best_inter / (gt_sizes.to(best_inter.device)[best_g] + 1e-6)
+
+            def _q(x: torch.Tensor, q: float) -> float:
+                if x.numel() == 0:
+                    return 0.0
+                return float(torch.quantile(x.to(dtype=torch.float32), torch.tensor(q, dtype=torch.float32)).item())
+
+            pred_quality = {
+                "best_iou": {"p50": _q(best_iou_pred, 0.5), "p90": _q(best_iou_pred, 0.9), "p95": _q(best_iou_pred, 0.95)},
+                "best_purity": {"p50": _q(best_purity_pred, 0.5), "p90": _q(best_purity_pred, 0.9), "p95": _q(best_purity_pred, 0.95)},
+                "best_coverage": {"p50": _q(best_cov_pred, 0.5), "p90": _q(best_cov_pred, 0.9), "p95": _q(best_cov_pred, 0.95)},
+                "useful_rate": float(((best_iou_pred >= 0.5) | (best_cov_pred >= 0.5)).float().mean().item()) if best_iou_pred.numel() else 0.0,
+                "best_iou_ge0p5_rate": float((best_iou_pred >= 0.5).float().mean().item()) if best_iou_pred.numel() else 0.0,
+                "best_cov_ge0p5_rate": float((best_cov_pred >= 0.5).float().mean().item()) if best_cov_pred.numel() else 0.0,
+                "best_purity_ge0p85_rate": float((best_purity_pred >= 0.85).float().mean().item()) if best_purity_pred.numel() else 0.0,
+            }
+
+            # Score-IoU calibration diagnostics (optional): correlation and oracle-rank.
+            score_iou = None
+            oracle_rank = None
+            oracle_at_k = None
+            if pred_scores_cpu is not None and int(pred_scores_cpu.numel()) == int(best_iou_pred.numel()):
+                s = pred_scores_cpu.to(dtype=torch.float32)
+                y = best_iou_pred.to(dtype=torch.float32)
+                # Pearson
+                sx = float(s.std(unbiased=False).item())
+                sy = float(y.std(unbiased=False).item())
+                pear = 0.0
+                if sx > 1e-6 and sy > 1e-6:
+                    pear = float(((s - s.mean()) * (y - y.mean())).mean().item() / (sx * sy))
+                # Spearman via rank correlation (ties are not specially handled).
+                spearman = 0.0
+                rs = torch.argsort(torch.argsort(s))
+                ry = torch.argsort(torch.argsort(y))
+                rxs = float(rs.float().std(unbiased=False).item())
+                rys = float(ry.float().std(unbiased=False).item())
+                if rxs > 1e-6 and rys > 1e-6:
+                    spearman = float(((rs.float() - rs.float().mean()) * (ry.float() - ry.float().mean())).mean().item() / (rxs * rys))
+                # High-score but low-IoU rates (top-20% scores).
+                topk = max(1, int(0.2 * int(s.numel())))
+                top_idx = torch.argsort(s, descending=True)[:topk]
+                top_low_iou = float((y[top_idx] < 0.3).float().mean().item())
+                top_low_cov = float((best_cov_pred[top_idx] < 0.3).float().mean().item())
+                score_iou = {
+                    'pearson': pear,
+                    'spearman': spearman,
+                    'top20_low_iou_rate': top_low_iou,
+                    'top20_low_cov_rate': top_low_cov,
+                }
+
+                # Oracle rank: for each GT, rank of the best-IoU prediction in score order.
+                score_order = torch.argsort(s, descending=True)
+                rank_pos = torch.empty_like(score_order)
+                rank_pos[score_order] = torch.arange(int(score_order.numel()), dtype=torch.long)
+                if iou.numel():
+                    p_best = torch.argmax(iou, dim=0)  # [G]
+                    ranks = rank_pos[p_best].to(dtype=torch.float32) + 1.0
+                    # quantiles
+                    oracle_rank = {
+                        'median': float(torch.quantile(ranks, torch.tensor(0.5)).item()) if ranks.numel() else 0.0,
+                        'p90': float(torch.quantile(ranks, torch.tensor(0.9)).item()) if ranks.numel() else 0.0,
+                        'gt_rank_gt20_rate': float((ranks > 20).float().mean().item()) if ranks.numel() else 0.0,
+                        'gt_rank_gt50_rate': float((ranks > 50).float().mean().item()) if ranks.numel() else 0.0,
+                    }
+                    # Oracle@K for IoU>=0.5
+                    iou_thr_or = 0.5
+                    oracle_at_k = {}
+                    for K in (20, 50, 100):
+                        kk = min(int(score_order.numel()), K)
+                        idxk = score_order[:kk]
+                        ok = (iou[idxk] >= iou_thr_or).any(dim=0).float().mean().item()
+                        oracle_at_k[f'K{K}'] = float(ok)
+            
+        except Exception:
+            pred_quality = {
+                "best_iou": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                "best_purity": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                "best_coverage": {"p50": 0.0, "p90": 0.0, "p95": 0.0},
+                "useful_rate": 0.0,
+                "best_iou_ge0p5_rate": 0.0,
+                "best_cov_ge0p5_rate": 0.0,
+                "best_purity_ge0p85_rate": 0.0,
+            }
+
         return {
             "n_gt": int(G),
             "n_pred": int(P),
@@ -390,6 +620,10 @@ class UnifiedSegMetric(SegMetric):
             "iou01": _hit(iou, float(iou_lo_thr)),
             "best_iou": {"eq0": best_eq0, "lt0p1": best_lt01, "btw0p1_0p5": best_01_05, "ge0p5": best_ge05},
             "mult_iou01": {"hit0": mult_hit0, "hit1": mult_hit1, "hit2": mult_hit2, "hit3p": mult_hit3p},
+            "pred_quality": pred_quality,
+            "score_iou": score_iou,
+            "oracle_rank": oracle_rank,
+            "oracle_at_k": oracle_at_k,
         }
 
     def compute_metrics(self, results):
@@ -461,6 +695,7 @@ class UnifiedSegMetric(SegMetric):
                         dup = self._compute_scene_gt_dup(
                             gt_inst=torch.as_tensor(inst_mask),
                             pred_inst=torch.as_tensor(single_pred_results['pts_instance_mask'][0]),
+                            pred_scores=torch.as_tensor(single_pred_results.get('instance_scores', [])),
                             min_gt_points=scene_min_pts,
                             iou_thr=scene_iou_thr,
                             iou_lo_thr=scene_iou_lo,
@@ -509,19 +744,9 @@ class UnifiedSegMetric(SegMetric):
                     pass
                 online_monitor_results.append(mon)
 
-        # Robustness: allow empty predictions (no instances) without crashing.
-        # Treat as cat-agnostic eval in this case.
-        max_pred_label = 0
-        try:
-            for _lb in pred_instance_labels:
-                if _lb is None:
-                    continue
-                if hasattr(_lb, "numel") and _lb.numel() > 0:
-                    max_pred_label = max(max_pred_label, int(_lb.max()))
-        except Exception:
-            max_pred_label = 0
-
-        if max_pred_label == 0:
+        # Instance AP evaluation mode:
+        # Prefer explicit `cat_agnostic` flag to avoid ambiguous heuristics.
+        if self.cat_agnostic is True:
             ret_inst = instance_cat_agnostic_eval(
                 gt_semantic_masks_inst_task,
                 gt_instance_masks_inst_task,
@@ -531,7 +756,7 @@ class UnifiedSegMetric(SegMetric):
                 valid_class_ids=self.valid_class_ids[num_stuff_cls:],
                 class_labels=classes[num_stuff_cls:-1],
                 logger=logger)
-        else:
+        elif self.cat_agnostic is False:
             # :-1 for unlabeled
             ret_inst = instance_seg_eval(
                 gt_semantic_masks_inst_task,
@@ -542,6 +767,40 @@ class UnifiedSegMetric(SegMetric):
                 valid_class_ids=self.valid_class_ids[num_stuff_cls:],
                 class_labels=classes[num_stuff_cls:-1],
                 logger=logger)
+        else:
+            # Legacy heuristic: treat "all labels == 0" as category-agnostic.
+            # NOTE: This is ambiguous when `0` is a valid class in category-aware
+            # setups. Prefer setting `cat_agnostic` explicitly in configs.
+            max_pred_label = 0
+            try:
+                for _lb in pred_instance_labels:
+                    if _lb is None:
+                        continue
+                    if hasattr(_lb, "numel") and _lb.numel() > 0:
+                        max_pred_label = max(max_pred_label, int(_lb.max()))
+            except Exception:
+                max_pred_label = 0
+
+            if max_pred_label == 0:
+                ret_inst = instance_cat_agnostic_eval(
+                    gt_semantic_masks_inst_task,
+                    gt_instance_masks_inst_task,
+                    pred_instance_masks_inst_task,
+                    pred_instance_labels,
+                    pred_instance_scores,
+                    valid_class_ids=self.valid_class_ids[num_stuff_cls:],
+                    class_labels=classes[num_stuff_cls:-1],
+                    logger=logger)
+            else:
+                ret_inst = instance_seg_eval(
+                    gt_semantic_masks_inst_task,
+                    gt_instance_masks_inst_task,
+                    pred_instance_masks_inst_task,
+                    pred_instance_labels,
+                    pred_instance_scores,
+                    valid_class_ids=self.valid_class_ids[num_stuff_cls:],
+                    class_labels=classes[num_stuff_cls:-1],
+                    logger=logger)
 
         metrics = dict()
         # for ret, keys in zip((ret_sem, ret_inst, ret_pan), self.logger_keys):
@@ -560,6 +819,34 @@ class UnifiedSegMetric(SegMetric):
             with open(os.path.join(out_dir, "online_monitor_summary.json"), "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
             logger.info(f"[UnifiedSegMetric] online monitor saved to: {out_dir}")
+
+            # Convenience: write a unified diagnostics summary for A/B panels (mask quality + injection sparsity).
+            try:
+                diag = dict(summary)
+                # Heuristic tags (optional, best-effort).
+                a = diag.get('scene_gt_dup', {}) if isinstance(diag.get('scene_gt_dup', None), dict) else {}
+                pq = a.get('pred_quality', {}) if isinstance(a.get('pred_quality', None), dict) else {}
+                b = diag.get('daca2d_apply', {}) if isinstance(diag.get('daca2d_apply', None), dict) else {}
+                # Conservative symptoms: purity up, coverage down, gray-zone up.
+                pur_p50 = float((pq.get('best_purity_p50', {}) or {}).get('median', 0.0))
+                cov_p50 = float((pq.get('best_coverage_p50', {}) or {}).get('median', 0.0))
+                gray = float(((a.get('best_iou', {}) or {}).get('btw0p1_0p5', {}) or {}).get('mean', 0.0))
+                # Sparse injection symptoms: allowed_zero high or density low.
+                allow0 = float((b.get('allowed_zero_rate', {}) or {}).get('mean', 0.0))
+                density = float((b.get('density', {}) or {}).get('mean', 0.0))
+                diag['diagnosis_heuristic'] = {
+                    'conservative_hint': bool((pur_p50 >= 0.85) and (cov_p50 <= 0.5) and (gray >= 0.15)),
+                    'sparse_injection_hint': bool((allow0 >= 0.5) or (density <= 0.05)),
+                    'purity_p50_median': pur_p50,
+                    'coverage_p50_median': cov_p50,
+                    'gt_best_iou_0p1_0p5_mean': gray,
+                    'allowed_zero_mean': allow0,
+                    'daca_density_mean': density,
+                }
+                with open(os.path.join(out_dir, 'diagnostics_summary.json'), 'w', encoding='utf-8') as f:
+                    json.dump(diag, f, indent=2, ensure_ascii=False, default=str)
+            except Exception:
+                pass
 
             # Optional: dump bbox/center(+feat) diag payloads (npz + summary) under the same out_dir.
             diag_cfg = mon_cfg.get("bbox_center_diag", {}) if isinstance(mon_cfg, dict) else {}

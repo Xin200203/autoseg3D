@@ -683,24 +683,49 @@ class BuildCamInfoFromPoses(BaseTransform):
 
 @TRANSFORMS.register_module()
 class SavePointsForProjection(BaseTransform):
-    """Cache a copy of points before 3D augmentations for 2D-3D projection."""
+    """Cache a copy of points before 3D augmentations for 2D-3D projection.
+
+    Notes:
+    - For MV pipelines that concatenate rec points (cat_rec), `results['points']`
+      may contain additional reconstruction points beyond `num_frames*num_sample`.
+      Downstream formatting expects `points_raw` to be reshape-able to
+      `[num_frames, num_sample, C]`, so we keep only the first `num_frames*num_sample`
+      points when this happens.
+    """
 
     def transform(self, results: dict) -> dict:
         pts = results.get('points', None)
         if pts is None:
             return results
+
+        num_frames = results.get('num_frames', None)
+        num_sample = results.get('num_sample', None)
+        num_points = None
+        try:
+            if num_frames is not None and num_sample is not None:
+                num_points = int(num_frames) * int(num_sample)
+        except Exception:
+            num_points = None
+
+        def _maybe_slice(x: torch.Tensor) -> torch.Tensor:
+            if num_points is not None and x.dim() >= 2 and x.shape[0] > num_points:
+                return x[:num_points].contiguous()
+            return x
+
         try:
             from mmdet3d.structures.points import BasePoints
             if isinstance(pts, BasePoints):
-                results['points_raw'] = pts.tensor.clone()
+                raw = pts.tensor.clone()
+                results['points_raw'] = _maybe_slice(raw)
                 return results
         except Exception:
             pass
+
         if torch.is_tensor(pts):
-            results['points_raw'] = pts.clone()
+            results['points_raw'] = _maybe_slice(pts.clone())
         else:
             try:
-                results['points_raw'] = torch.as_tensor(pts).clone()
+                results['points_raw'] = _maybe_slice(torch.as_tensor(pts).clone())
             except Exception:
                 pass
         return results

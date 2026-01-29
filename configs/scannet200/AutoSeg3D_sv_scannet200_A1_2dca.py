@@ -70,7 +70,10 @@ train_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5]),
     dict(type='SavePointsForProjection'),
-    dict(type='PrepareSVForOnline', apply_axis_align=True),
+    # NOTE: scannet200-sv_fast points are already consistent with raw `pose`
+    # in infos; applying `axis_align_matrix` to pose breaks 2D-3D projection
+    # for a large fraction of frames (valid_ratio can drop to 0).
+    dict(type='PrepareSVForOnline', apply_axis_align=False),
     dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
     dict(type='ResizeForGDINO', target_size=gdino_img_hw),
     dict(type='NormalizeCamInfo', strict=True),
@@ -128,7 +131,8 @@ test_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5]),
     dict(type='SavePointsForProjection'),
-    dict(type='PrepareSVForOnline', apply_axis_align=True),
+    # NOTE: keep consistent with train pipeline (see comment above).
+    dict(type='PrepareSVForOnline', apply_axis_align=False),
     dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
     dict(type='ResizeForGDINO', target_size=gdino_img_hw),
     dict(type='NormalizeCamInfo', strict=True),
@@ -151,20 +155,22 @@ test_pipeline = [
                 type='NormalizePointsColor_',
                 color_mean=color_mean,
                 color_std=color_std),
-            dict(
-                type='AddSuperPointAnnotations',
-                num_classes=num_semantic_classes,
-                stuff_classes=[0, 1],
-                merge_non_stuff_cls=False),
-            dict(
-                type='Pack3DDetInputs_SVOnline',
-                keys=[
-                    'points', 'points_raw', 'gt_labels_3d', 'pts_semantic_mask',
-                    'pts_instance_mask', 'sp_pts_mask', 'gt_sp_masks',
-                    'img_paths', 'poses', 'cam_info',
-                ],
-                dataset_type='scannet200'),
-        ])
+	            dict(
+	                type='AddSuperPointAnnotations',
+	                num_classes=num_semantic_classes,
+	                stuff_classes=[0, 1],
+	                merge_non_stuff_cls=False),
+	        ]),
+	    # NOTE: pack must be AFTER MultiScaleFlipAug3D; otherwise the multi-scale
+	    # wrapper may drop/overwrite `data_samples` and cause val_step crash.
+	    dict(
+	        type='Pack3DDetInputs_SVOnline',
+        keys=[
+            'points', 'points_raw', 'gt_labels_3d', 'pts_semantic_mask',
+            'pts_instance_mask', 'sp_pts_mask', 'gt_sp_masks',
+            'img_paths', 'poses', 'cam_info',
+        ],
+        dataset_type='scannet200'),
 ]
 
 # IMPORTANT: baseline `train_dataloader` is constructed with the *base* `train_pipeline`
@@ -173,3 +179,21 @@ test_pipeline = [
 train_dataloader = dict(dataset=dict(pipeline=train_pipeline))
 val_dataloader = dict(dataset=dict(pipeline=test_pipeline))
 test_dataloader = val_dataloader
+
+# -----------------------------------------------------------------------------
+# Checkpoint saving policy (avoid 1.4GB-per-epoch explosion in ablations).
+# Save only `best` (by `all_ap_50%`) and `latest` (rolling last epoch).
+# -----------------------------------------------------------------------------
+default_hooks = dict(
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=1,
+        max_keep_ckpts=1,
+        save_last=True,
+        save_best='all_ap_50%',
+        rule='greater',
+        _scope_='mmdet3d',
+    ))
+
+# Validate more frequently for ablations (keep identical to SV baseline except val_interval).
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=8)

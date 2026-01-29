@@ -4,49 +4,160 @@ _base_ = [
 ]
 custom_imports = dict(imports=['oneformer3d'])
 
-num_instance_classes = 1
+num_instance_classes = 198
 num_semantic_classes = 200
-num_instance_classes_eval = 1
+num_instance_classes_eval = 198
+use_bbox = True
 voxel_size = 0.02
 
-# --- SegDINO3D-style: 256d point-level early fusion + object-level DACA-2D ---
-gdino_target_size = (420, 560)  # (H,W), keep ratio with ScanNet 480x640
-gdino_in_dim = 256
-gdino_out_dim = 256  # V3: feed 256d into MinkUNet (in_channels = 3+256)
+# GDINO (GroundingDINO) settings for online 2D-3D fusion (A3-style).
+gdino_ckpt = '/home/nebula/xxy/dataset/models/groundingdino_swinb_cogcoor.pth'
+gdino_repo = '/home/nebula/xxy/GroundingDINO'
+gdino_cfg = '/home/nebula/xxy/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py'
+gdino_img_hw = (420, 560)  # (H,W)
+
+
+# Added
+load_interval = 1
+val_load_interval = 1
+use_track_loss = False
+use_query_memory = True
+use_noise = False
+use_temporal_loss = False
+use_sp_gt_ids = False # whether to use sp_gt_ids for training, default True
+use_decouple = False # whether to use decouple loss, default False
+inst_thereshold = 0.5 # 超点实例掩码的阈值
+sem_thereshold = 0.5 
+use_aug = False
+use_mot = False
+asso_loss_weight = 0.5
+
+mot_type = 'dq_track'
+objectness_flag = False
+train_asso_only = False
+replace_bn_with_ln = False
+asso_config = dict(
+    asso_loss_weight=0.5,
+    query_trans= dict(with_att=True, with_pos= True, min_channels= 256, drop_rate= 0.0, mode='with_pos'),
+    train_asso_only= True,
+)
+use_one2many = True
+criterion_one2many = dict(
+        type='ScanNetMixedCriterion',
+        num_semantic_classes=num_semantic_classes,
+        sem_criterion=dict(
+            type='ScanNetSemanticCriterion',
+            ignore_index=num_semantic_classes,
+            loss_weight=0.5),
+        inst_criterion=dict(
+            type='MixedInstanceCriterion',
+            matcher=dict(
+            type='One2Many_Matcher',
+            costs=[
+                dict(type='QueryClassificationCost', weight=0.5),
+                dict(type='MaskBCECost', weight=1.0),
+                dict(type='MaskDiceCost', weight=1.0)],
+            topk=2),
+            bbox_loss=dict(type='AxisAlignedIoULoss'),
+            loss_weight=[0.5, 1.0, 1.0, 0.5, 0.5],
+            num_classes=num_instance_classes,
+            non_object_weight=0.1,
+            fix_dice_loss_weight=True,
+            iter_matcher=True,
+            fix_mean_loss=True)),
+matcher=dict(
+        type='SparseMatcher',
+        costs=[
+            dict(type='QueryClassificationCost', weight=0.5),
+            dict(type='MaskBCECost', weight=1.0),
+            dict(type='MaskDiceCost', weight=1.0)],
+        topk=1)
+# matcher=dict(
+#     type = 'HungarianMatcher',
+#     costs=[
+#         dict(type='QueryClassificationCost', weight=0.5),
+#         dict(type='MaskBCECost', weight=1.0),
+#         dict(type='MaskDiceCost', weight=1.0)])
+more_keys_list = ['sp_gt_inst_ids', 'sp_gt_semantic_ids']
+# Ended
 
 model = dict(
-    # Reuse Online model implementation for SV (T=1); disable mapping/tracking.
     type='ScanNet200MixFormer3D_Online',
+    gdino_backbone=dict(
+        type='GroundingDINOBackbone',
+        repo_dir=gdino_repo,
+        config_path=gdino_cfg,
+        checkpoint=gdino_ckpt,
+        device='cuda',
+        caption='object.',
+    ),
+    gdino_point_fusion=dict(
+        enable=True,
+        in_dim=256,
+        out_dim=256,
+        proj_type='identity',
+        mode='fpn',
+        fuse_mode='fpn',
+        feat_levels=[0, 1, 2, 3],
+        backbone_only=True,
+        max_depth=10.0,
+        align_corners=False,
+        strict=True,
+        strict_valid_ratio=0.95,
+        log_fail=True,
+    ),
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=voxel_size,
+
+    use_query_memory=use_query_memory,
+    use_noise=use_noise, 
+    use_temporal_loss=use_temporal_loss,
+    use_decouple=use_decouple,
+    use_mot=use_mot,
+    mot_type=mot_type,
+    train_asso_only=train_asso_only,
+    matcher=matcher,
+    use_aug=use_aug,
+    asso_loss_weight=asso_loss_weight,
+    asso_config=asso_config,
+    use_one2many=use_one2many,
+    criterion_one2many=criterion_one2many,
+    replace_bn_with_ln=replace_bn_with_ln,
+
     num_classes=num_instance_classes_eval,
     query_thr=0.5,
-    map_to_rec_pcd=False,
-
-    use_query_memory=False,
-    use_temporal_loss=False,
-    use_decouple=False,
-    use_mot=False,
-    merge_sp_masks=False,
-    debug_mode=False,
-
     backbone=dict(
         type='Res16UNet34C',
-        in_channels=3 + gdino_out_dim,
+        in_channels=3,
         out_channels=96,
-        config=dict(dilations=[1, 1, 1, 1], conv1_kernel_size=5, bn_momentum=0.02)),
-    memory=dict(type='MultilevelMemory', in_channels=[32, 64, 128, 256], queue=-1, vmp_layer=(0, 1, 2, 3)),
+        dino_dim=256,
+        config=dict(
+            dilations=[1, 1, 1, 1],
+            conv1_kernel_size=5,
+            bn_momentum=0.02,
+            dino_strict=True,
+            dino_min_hit_ratio=0.95,
+            dino_residual=True,
+        )),
+    memory=dict(type='MultilevelMemory', in_channels=[32, 64, 128, 256], queue=-1, vmp_layer=(0,1,2,3)),
     pool=dict(type='GeoAwarePooling', channel_proj=96),
     decoder=dict(
         type='ScanNetMixQueryDecoder',
-        # V3 ablation: deepen decoder to test if 2D injection needs more depth.
-        num_layers=6,
+        use_track_loss=use_track_loss,
+        use_temporal_loss=use_temporal_loss,
+        use_decouple=use_decouple,
+        use_mot=use_mot,
+        mot_type=mot_type,
+        
+        num_layers=3,
         share_attn_mlp=False,
+        # use_query_memory2=True,
+        query_stage=[0, 1],
         share_mask_mlp=False,
-        # length = num_layers + 1 (iter_pred)
-        cross_attn_mode=["", "SP", "SP", "SP", "SP", "SP", "SP"],
-        # keep SP in early layers (for DACA-2D), refine with P at the end
-        mask_pred_mode=["SP", "SP", "SP", "SP", "P", "P", "P"],
+        temporal_attn=False,
+        # the last mp_mode should be "P"
+        cross_attn_mode=["", "SP", "SP", "SP"], 
+        mask_pred_mode=["SP", "SP", "P", "P"],
         num_instance_queries=0,
         num_semantic_queries=0,
         num_instance_classes=num_instance_classes,
@@ -61,16 +172,10 @@ model = dict(
         iter_pred=True,
         attn_mask=True,
         fix_attention=True,
-        objectness_flag=False,
-        temporal_attn=False,
-        bbox_flag=True,
-        # SegDINO3D-style box-modulated CA-3D (optional).
-        box3d_ca3d=dict(
-            enable=True,
-            layers=[0],
-            use_modulation=True,
-            temperature=10000.0,
-        )),
+        objectness_flag=objectness_flag,
+        bbox_flag=use_bbox),
+    merge_head=dict(type='MergeHead', in_channels=256, out_channels=256, norm='layer'),
+    # merge_criterion=dict(type='ScanNetMergeCriterion_Fast', tmp=True, p2s=False),
     criterion=dict(
         type='ScanNetMixedCriterion',
         num_semantic_classes=num_semantic_classes,
@@ -80,79 +185,32 @@ model = dict(
             loss_weight=0.5),
         inst_criterion=dict(
             type='MixedInstanceCriterion',
-            matcher=dict(
-                type='SparseMatcher',
-                costs=[
-                    dict(type='QueryClassificationCost', weight=0.5),
-                    dict(type='MaskBCECost', weight=1.0),
-                    dict(type='MaskDiceCost', weight=1.0),
-                    dict(type='CenterL1Cost', weight=0.5),
-                    dict(type='SizeL1Cost', weight=0.5)],
-                topk=1),
+            matcher=matcher,
             bbox_loss=dict(type='AxisAlignedIoULoss'),
-            # [cls, bce, dice, score, bbox_iou, center_l1, size_l1]
-            # score loss is typically unused when objectness_flag=False; keep weight for backward-compat.
-            loss_weight=[0.5, 1.0, 1.0, 0.0, 0.5, 0.5, 0.5],
+            loss_weight=[0.5, 1.0, 1.0, 0.5, 0.5],
             num_classes=num_instance_classes,
             non_object_weight=0.1,
             fix_dice_loss_weight=True,
             iter_matcher=True,
             fix_mean_loss=True)),
-
-    gdino_backbone=dict(
-        type='GroundingDINOBackbone',
-        repo_dir='/home/nebula/xxy/GroundingDINO',
-        config_path='/home/nebula/xxy/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py',
-        checkpoint='/home/nebula/xxy/dataset/models/groundingdino_swinb_cogcoor.pth',
-        device='cuda',
-        caption='object.',
-    ),
-
-    gdino_point_fusion=dict(
-        enable=True,
-        in_dim=gdino_in_dim,
-        out_dim=gdino_out_dim,
-        proj_type='identity',
-        feat_level=0,
-        img_size=gdino_target_size,
-        frame_stride=1,
-        max_frames=0,
-        max_depth=10.0,
-        align_corners=False,
-        strict=True,
-        strict_valid_ratio=0.95,
-        log_fail=True,
-        log_valid_every=50,
-        gdino=dict(backbone=dict(type='GroundingDINOBackbone')),
-    ),
-
     train_cfg=dict(
-        log_missing_bboxes=False,
-        # Compute GT axis-aligned bboxes/centers/sizes on-the-fly (SV infos may omit bboxes_3d).
-        compute_gt_bboxes_3d=True,
         gdino_daca2d=dict(
             enable=True,
-            # same image resize as point_fusion; relies on pipeline to keep cam_info consistent
-            img_size=gdino_target_size,
-            max_depth=10.0,
-            score_thr=0.15,
+            mode='fuse',
+            score_thr=0.10,
             max_queries=50,
-            query3d_center=dict(min_support_pts=30, reduce='median'),
-            strict=True,
-            strict_valid_ratio=0.90,
+            max_depth=10.0,
             log_valid_every=50,
-            log_first=True,
-            order='paper',
-            inject_domain='sp',
-            inject_layers='auto_sp',
-            mask=dict(thr=0.2, metric='l1'),
+            strict=True,
+            log_fail=True,
+            mask=dict(metric='l1', thr=0.3, domain='sp', order='paper'),
         ),
     ),
     test_cfg=dict(
-        merge_type='concat',
+        # TODO: a larger topK may be better
         topk_insts=100,
         inscat_topk_insts=100,
-        inst_score_thr=0.0,
+        inst_score_thr=0.3,
         pan_score_thr=0.5,
         npoint_thr=100,
         obj_normalization=True,
@@ -160,31 +218,10 @@ model = dict(
         nms=True,
         matrix_nms_kernel='linear',
         stuff_classes=[0, 1],
-        gdino_daca2d=dict(
-            enable=True,
-            img_size=gdino_target_size,
-            max_depth=10.0,
-            score_thr=0.15,
-            max_queries=50,
-            query3d_center=dict(min_support_pts=30, reduce='median'),
-            strict=False,
-            strict_valid_ratio=0.90,
-            log_valid_every=0,
-            order='paper',
-            inject_domain='sp',
-            inject_layers='auto_sp',
-            mask=dict(thr=0.2, metric='l1'),
-        ),
-    ),
-)
+        merge_type='learnable_online'))
 
-dataset_type = 'ScanNet200SegDataset_'
-data_root = '/home/nebula/xxy/dataset/data/scannet200-sv/'
-data_prefix = dict(
-    pts='points',
-    pts_instance_mask='instance_mask',
-    pts_semantic_mask='semantic_mask',
-    sp_pts_mask='super_points')
+dataset_type = 'ScanNet200SegMVDataset_'
+data_root = 'data/scannet200-mv_fast/'
 
 # floor and chair are changed
 class_names = [
@@ -237,139 +274,141 @@ color_std = (
     0.27566157565723015 * 255,
     0.27018971370874995 * 255)
 
+# dataset settings
 train_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='LoadAdjacentDataFromFile',
         coord_type='DEPTH',
         shift_height=False,
         use_color=True,
         load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5]),
-    dict(
-        type='LoadAnnotations3D_',
+        use_dim=[0, 1, 2, 3, 4, 5],
+        num_frames=8,
+        num_sample=20000,
         with_bbox_3d=False,
         with_label_3d=False,
         with_mask_3d=True,
         with_seg_3d=True,
-        with_sp_mask_3d=True),
-    dict(type='PrepareSVForOnline', apply_axis_align=False),
-    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
-    dict(type='ResizeForGDINO', target_size=gdino_target_size),
-    dict(type='NormalizeCamInfo', strict=True),
+        with_sp_mask_3d=True,
+        with_rec=use_bbox, cat_rec=use_bbox,
+        dataset_type='scannet200',
+        keep_img_paths_poses=True),
+    # Prepare raw points + camera info for GDINO point_fusion / DACA2D.
+    # Must happen before any 3D augmentations so projection stays consistent.
     dict(type='SavePointsForProjection'),
-    dict(type='SwapChairAndFloor'),
-    dict(type='PointSegClassMapping'),
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
+    dict(type='ResizeForGDINO', target_size=gdino_img_hw),
+    dict(type='NormalizeCamInfo', strict=True),
+    dict(type='SwapChairAndFloorWithRec' if use_bbox else 'SwapChairAndFloor'),
+    dict(type='PointSegClassMappingWithRec' if use_bbox else 'PointSegClassMapping'),
     dict(
         type='RandomFlip3D',
+        sync_2d=False,
         flip_ratio_bev_horizontal=0.5,
         flip_ratio_bev_vertical=0.5),
     dict(
         type='GlobalRotScaleTrans',
-        rot_range=[-0.78539816, 0.78539816],
+        rot_range=[-3.14, 3.14],
         scale_ratio_range=[0.8, 1.2],
         translation_std=[0.1, 0.1, 0.1],
         shift_height=False),
-    dict(type='NormalizePointsColor_', color_mean=color_mean, color_std=color_std),
-    # IMPORTANT: Online variant returns per-frame lists (len=T), required by Online model loss().
+    dict(
+        type='NormalizePointsColor_',
+        color_mean=color_mean,
+        color_std=color_std),
     dict(
         type='AddSuperPointAnnotations_Online',
         num_classes=num_semantic_classes,
+        use_sp_gt_ids=use_sp_gt_ids,  # whether to use sp_gt_ids for training
+        inst_thereshold=inst_thereshold,  # 超点实例掩码的阈值
+        sem_thereshold=sem_thereshold,  # 超点语义掩码的阈值
         stuff_classes=[0, 1],
         merge_non_stuff_cls=False,
-        with_rec=False,
-        use_sp_gt_ids=False),
+        with_rec=use_bbox),
     dict(
         type='ElasticTransfrom',
         gran=[6, 20],
         mag=[40, 160],
         voxel_size=voxel_size,
-        p=0.5),
+        p=0.5,
+        with_rec=use_bbox),
+    dict(type='BboxCalculation' if use_bbox else 'NoOperation', voxel_size=voxel_size),
     dict(
         type='Pack3DDetInputs_Online',
-        dataset_type='scannet200',
         keys=[
-            'points',
-            'points_raw',
-            'gt_labels_3d',
-            'pts_semantic_mask',
-            'pts_instance_mask',
-            'sp_pts_mask',
-            'gt_sp_masks',
-            'elastic_coords',
-            'img_paths',
-            'poses',
-            'cam_info',
-        ])
+            'points', 'points_raw', 'img_paths', 'poses', 'cam_info', 'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
+            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords'
+        ] + ['gt_bboxes_3d'] if use_bbox else [], 
+        added_keys=more_keys_list)
 ]
-
 test_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='LoadAdjacentDataFromFile',
         coord_type='DEPTH',
         shift_height=False,
         use_color=True,
         load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5]),
-    dict(
-        type='LoadAnnotations3D_',
+        use_dim=[0, 1, 2, 3, 4, 5],
+        num_frames=-1,
+        num_sample=20000,
         with_bbox_3d=False,
         with_label_3d=False,
         with_mask_3d=True,
         with_seg_3d=True,
-        with_sp_mask_3d=True),
-    dict(type='PrepareSVForOnline', apply_axis_align=False),
-    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
-    dict(type='ResizeForGDINO', target_size=gdino_target_size),
-    dict(type='NormalizeCamInfo', strict=True),
+        with_sp_mask_3d=True,
+        with_rec=True,
+        keep_img_paths_poses=True,
+        dataset_type='scannet200'),
     dict(type='SavePointsForProjection'),
-    dict(type='SwapChairAndFloor'),
-    dict(type='PointSegClassMapping'),
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
+    dict(type='ResizeForGDINO', target_size=gdino_img_hw),
+    dict(type='NormalizeCamInfo', strict=True),
+    dict(type='SwapChairAndFloorWithRec'),
+    dict(type='PointSegClassMappingWithRec'),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
         pts_scale_ratio=1,
         flip=False,
         transforms=[
-            dict(type='NormalizePointsColor_', color_mean=color_mean, color_std=color_std),
+            dict(
+                type='NormalizePointsColor_',
+                color_mean=color_mean,
+                color_std=color_std),
+            dict(
+                type='AddSuperPointAnnotations_Online',
+                num_classes=num_semantic_classes,
+                stuff_classes=[0, 1],
+                merge_non_stuff_cls=False,
+                with_rec=True),
         ]),
-    dict(
-        type='Pack3DDetInputs_Online',
-        dataset_type='scannet200',
-        keys=[
-            'points',
-            'points_raw',
-            'gt_labels_3d',
-            'pts_semantic_mask',
-            'pts_instance_mask',
-            'sp_pts_mask',
-            'img_paths',
-            'poses',
-            'cam_info',
-        ])
+    dict(type='Pack3DDetInputs_Online', keys=['points', 'points_raw', 'img_paths', 'poses', 'cam_info', 'sp_pts_mask'])
 ]
 
 train_dataloader = dict(
-    # Match AutoSeg3D_sv_scannet200.py hyperparams (may reduce if OOM with 2D fusion enabled).
-    batch_size=16,
+    batch_size=4,
     num_workers=6,
+    persistent_workers=True,
+    # persistent_workers=False,
+    # num_workers=0,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_sv_oneformer3d_infos_train.pkl',
+        load_interval=load_interval,
+        ann_file='scannet200_mv_oneformer3d_infos_train.pkl',
         data_root=data_root,
-        data_prefix=data_prefix,
         metainfo=dict(classes=class_names),
         pipeline=train_pipeline,
         ignore_index=num_semantic_classes,
         scene_idxs=None,
         test_mode=False))
 val_dataloader = dict(
-    batch_size=1,
     num_workers=6,
+    persistent_workers=True,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_sv_oneformer3d_infos_val.pkl',
+        load_interval=val_load_interval,
+        ann_file='scannet200_mv_oneformer3d_infos_val.pkl',
         data_root=data_root,
-        data_prefix=data_prefix,
         metainfo=dict(classes=class_names),
         pipeline=test_pipeline,
         ignore_index=num_semantic_classes,
@@ -400,10 +439,11 @@ sem_mapping = [
 inst_mapping = sem_mapping[2:]
 
 val_evaluator = dict(
+    cat_agnostic=False,
     type='UnifiedSegMetric',
-    stuff_class_inds=[0, 1],
+    stuff_class_inds=[0, 1], 
     thing_class_inds=list(range(2, num_semantic_classes)),
-    min_num_points=1,
+    min_num_points=1, 
     id_offset=2**16,
     sem_mapping=sem_mapping,
     inst_mapping=inst_mapping,
@@ -415,27 +455,37 @@ optim_wrapper = dict(
     optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),
     clip_grad=dict(max_norm=10, norm_type=2))
 
+# learning rate
 param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
+
 custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
+default_hooks = dict(
+    checkpoint=dict(
+        interval=1,
+        max_keep_ckpts=1,
+        save_best=['all_ap_50%'],
+        rule='greater'))
 
-load_from = None
+# choose a best pth
+load_from = '/home/nebula/xxy/AutoSeg3D/work_dirs/ablation_sv/A3_cat_fpn_2dca_autoloss_l1thr0p30_20260127_173500/best_all_ap_50%_epoch_64.pth'
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=16)
+
+# training schedule for 1x
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=8)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
+# Hooks: save only latest + best AP50
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
     logger=dict(type='LoggerHook', interval=50),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    # Save only the latest checkpoint and the best one by AP50.
     checkpoint=dict(
         type='CheckpointHook',
         interval=1,
         max_keep_ckpts=1,
-        save_best='all_ap_50%',
-        rule='greater',
         save_last=True,
-    ),
+        save_best='all_ap_50%',
+        rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='Det3DVisualizationHook'))

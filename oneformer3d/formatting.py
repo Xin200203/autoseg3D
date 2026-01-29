@@ -15,7 +15,14 @@ import PIL.Image as Image
 class Pack3DDetInputs_(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords','img_path']
+    # NOTE: for single-frame SV training with online 2D-3D alignment modules
+    # (e.g., GDINO point fusion / DACA-2D), we also allow python-object inputs
+    # such as `img_paths/poses/cam_info`, plus `points_raw` for projection.
+    # These keys will be passed through as-is (no to_tensor conversion).
+    INPUTS_KEYS = [
+        'points', 'points_raw', 'img', 'elastic_coords', 'img_path',
+        'img_paths', 'poses', 'cam_info'
+    ]
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',
@@ -131,6 +138,11 @@ class Pack3DDetInputs_(Pack3DDetInputs):
         for key in self.meta_keys:
             if key in results:
                 img_metas[key] = results[key]
+        # Pass through python-object metadata for online 2D-3D alignment
+        # (e.g., GDINO point fusion / DACA-2D) without tensor conversion.
+        for k in ('cam_info', 'img_paths', 'poses'):
+            if k in results:
+                img_metas[k] = results[k]
         data_sample.img_metas = img_metas
         # data_sample.set_metainfo(img_metas)
 
@@ -418,11 +430,28 @@ class Pack3DDetInputs_SVOnline(Pack3DDetInputs):
 
     def pack_single_results(self, results: dict) -> dict:
         # Format points to tensor (keep 2D shape for SV models).
+        # In test-time augmentation, values may be lists.
         if 'points' in results:
-            if isinstance(results['points'], BasePoints):
+            if isinstance(results['points'], list):
+                pts_list = []
+                for p in results['points']:
+                    if isinstance(p, BasePoints):
+                        pts_list.append(p.tensor)
+                    else:
+                        pts_list.append(p)
+                results['points'] = pts_list
+            elif isinstance(results['points'], BasePoints):
                 results['points'] = results['points'].tensor
         if 'points_raw' in results:
-            if isinstance(results['points_raw'], BasePoints):
+            if isinstance(results['points_raw'], list):
+                pts_list = []
+                for p in results['points_raw']:
+                    if isinstance(p, BasePoints):
+                        pts_list.append(p.tensor)
+                    else:
+                        pts_list.append(p)
+                results['points_raw'] = pts_list
+            elif isinstance(results['points_raw'], BasePoints):
                 results['points_raw'] = results['points_raw'].tensor
 
         # Only tensorize known numeric keys; keep metadata python objects as-is.

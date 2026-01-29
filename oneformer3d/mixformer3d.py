@@ -7,6 +7,7 @@ import MinkowskiEngine as ME
 import pointops
 import pdb, time
 from functools import partial
+from contextlib import nullcontext
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import PointData
 from mmdet3d.models import Base3DDetector
@@ -20,6 +21,8 @@ from .img_backbone import point_sample, apply_3d_transformation
 import os
 from PIL import Image
 from .projection_utils import MIN_DEPTH, scale_uv_img_to_feat, project_points_to_uv, sample_img_feat
+# Optional disk cache for GDINO outputs (srcs/hs_last/boxes/scores).
+from .gdino_cache import load_gdino_cache_batched, load_gdino_cache_single
 # Sparse FPN builder (ESAM-style): point-wise 2D feats -> [s1,s2,s4,s8,s16]
 from .dino_sparse_fpn import build_sparse_fpn
 # Added
@@ -222,39 +225,92 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         B = len(batch_data_samples)
         device = pts_aug_in[0].device
 
-        cams, img_paths, imgs = [], [], []
+        cams, img_paths = [], []
         for b in range(B):
             meta_b = getattr(batch_data_samples[b], "metainfo", None)
             if callable(meta_b):
                 meta_b = meta_b()
-            if not isinstance(meta_b, dict):
-                meta_b = getattr(batch_data_samples[b], "img_metas", {}) or {}
+            # Some custom Pack3DDetInputs_ variants store 2D-3D metadata in
+            # `img_metas` instead of `metainfo()`. Prefer `img_metas` when
+            # required keys are missing, otherwise GDINO will treat the sample
+            # as invalid and skip the whole batch.
+            if (not isinstance(meta_b, dict)) or ('cam_info' not in meta_b and 'img_paths' not in meta_b):
+                meta_b = getattr(batch_data_samples[b], "img_metas", {}) or (meta_b if isinstance(meta_b, dict) else {})
             cam, img_path = self._unwrap_cam_and_img(meta_b, frame_i=int(frame_i))
             if cam is None or img_path is None:
                 cams.append(None)
                 img_paths.append(None)
-                imgs.append(None)
                 continue
             cams.append(cam)
             img_paths.append(img_path)
-            try:
-                img = Image.open(img_path).convert("RGB")
-                img_size = cam.get("img_size_gdino", None)
-                if torch.is_tensor(img_size):
-                    h1, w1 = int(img_size[0].item()), int(img_size[1].item())
-                    if (img.height, img.width) != (h1, w1):
-                        img = img.resize((w1, h1), resample=Image.BILINEAR)
-                imgs.append(img)
-            except Exception:
-                imgs.append(None)
 
-        if any(im is None for im in imgs):
-            return None, {"skipped": "img_load_failed", "frame": int(frame_i)}
+        srcs = None
+        cache_dir = cfg.get("cache_dir", None)
+        if cache_dir is None and isinstance(cfg.get("cache", None), dict):
+            cache_dir = cfg.get("cache", {}).get("dir", None) or cfg.get("cache", {}).get("cache_dir", None)
+        if cache_dir is None:
+            cache_dir = os.environ.get("GDINO_CACHE_DIR", None)
 
-        img_t = torch.stack([self._to_tensor_img(im, device=device) for im in imgs], dim=0)
-        gdino = self._get_gdino_backbone(cfg.get("gdino", None))
-        out = gdino(img_t, backbone_only=bool(cfg.get("backbone_only", True)))
-        srcs = out.get("srcs", None)
+        if cache_dir is not None and all(isinstance(p, str) for p in img_paths) and all(isinstance(c, dict) for c in cams):
+            # Require consistent target size across the batch.
+            hw0 = cams[0].get("img_size_gdino", None)
+            if torch.is_tensor(hw0) and hw0.numel() == 2:
+                target_hw = (int(hw0.reshape(-1)[0].item()), int(hw0.reshape(-1)[1].item()))
+                bb_cfg = None
+                if isinstance(cfg.get("gdino", None), dict):
+                    bb_cfg = cfg["gdino"].get("backbone", None)
+                if not isinstance(bb_cfg, dict):
+                    bb_cfg = getattr(self, "_gdino_backbone_cfg", None)
+                cached = load_gdino_cache_batched(
+                    cache_dir,
+                    img_paths=[str(p) for p in img_paths],
+                    target_hw=target_hw,
+                    bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                    mode="full",
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if isinstance(cached, dict):
+                    srcs = cached.get("srcs", None)
+                if not isinstance(srcs, list) or len(srcs) == 0:
+                    cached = load_gdino_cache_batched(
+                        cache_dir,
+                        img_paths=[str(p) for p in img_paths],
+                        target_hw=target_hw,
+                        bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                        mode="backbone",
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    if isinstance(cached, dict):
+                        srcs = cached.get("srcs", None)
+
+        if not isinstance(srcs, list) or len(srcs) == 0:
+            imgs = []
+            for b in range(B):
+                cam = cams[b]
+                img_path = img_paths[b]
+                if cam is None or img_path is None:
+                    imgs.append(None)
+                    continue
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    img_size = cam.get("img_size_gdino", None)
+                    if torch.is_tensor(img_size):
+                        h1, w1 = int(img_size[0].item()), int(img_size[1].item())
+                        if (img.height, img.width) != (h1, w1):
+                            img = img.resize((w1, h1), resample=Image.BILINEAR)
+                    imgs.append(img)
+                except Exception:
+                    imgs.append(None)
+
+            if any(im is None for im in imgs):
+                return None, {"skipped": "img_load_failed", "frame": int(frame_i)}
+
+            img_t = torch.stack([self._to_tensor_img(im, device=device) for im in imgs], dim=0)
+            gdino = self._get_gdino_backbone(cfg.get("gdino", None))
+            out = gdino(img_t, backbone_only=bool(cfg.get("backbone_only", True)))
+            srcs = out.get("srcs", None)
         if not isinstance(srcs, list) or len(srcs) == 0:
             return None, {"skipped": "no_srcs", "frame": int(frame_i)}
 
@@ -268,14 +324,17 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 continue
             intr = cam.get("intrinsics", None)
             if isinstance(intr, (list, tuple)) and len(intr) == 1 and torch.is_tensor(intr[0]):
-                intr_t = intr[0].reshape(-1)[:4]
+                intr_t = intr[0].to(device=device, dtype=torch.float32).reshape(-1)[:4]
             elif torch.is_tensor(intr):
-                intr_t = intr.reshape(-1)[:4]
+                intr_t = intr.to(device=device, dtype=torch.float32).reshape(-1)[:4]
             else:
                 intr_t = torch.as_tensor(intr, device=device, dtype=torch.float32).reshape(-1)[:4]
             fx, fy, cx, cy = [float(v) for v in intr_t.tolist()]
             pose = cam.get("pose", cam.get("extrinsics", None))
-            pose_t = pose if torch.is_tensor(pose) else torch.as_tensor(pose, device=device, dtype=torch.float32).reshape(4, 4)
+            if torch.is_tensor(pose):
+                pose_t = pose.to(device=device, dtype=torch.float32).reshape(4, 4)
+            else:
+                pose_t = torch.as_tensor(pose, device=device, dtype=torch.float32).reshape(4, 4)
             img_hw = cam.get("img_size_gdino", None)
             if torch.is_tensor(img_hw):
                 h_img, w_img = int(img_hw[0].item()), int(img_hw[1].item())
@@ -399,6 +458,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         score_thr = float(cfg.get("score_thr", 0.25))
         max_queries = int(cfg.get("max_queries", 50))
         max_depth = float(cfg.get("max_depth", 10.0))
+        min_support = int(cfg.get("query3d_center", {}).get("min_support_pts", 30))
+        big_box_thr = float(cfg.get("support_stats", {}).get("big_box_area_px", 10000.0))
 
         pts_raw_in = batch_inputs_dict.get("points_raw", None)
         pts_aug_in = batch_inputs_dict.get("points", None)
@@ -407,7 +468,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         B = len(batch_data_samples)
         device = pts_aug_in[0].device
 
-        cams, imgs = [], []
+        cams, img_paths = [], []
         for b in range(B):
             meta_b = getattr(batch_data_samples[b], "metainfo", None)
             if callable(meta_b):
@@ -417,29 +478,68 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             cam, img_path = self._unwrap_cam_and_img(meta_b, frame_i=int(frame_i))
             if cam is None or img_path is None:
                 cams.append(None)
-                imgs.append(None)
+                img_paths.append(None)
                 continue
             cams.append(cam)
-            try:
-                img = Image.open(img_path).convert("RGB")
-                img_size = cam.get("img_size_gdino", None)
-                if torch.is_tensor(img_size):
-                    h1, w1 = int(img_size[0].item()), int(img_size[1].item())
-                    if (img.height, img.width) != (h1, w1):
-                        img = img.resize((w1, h1), resample=Image.BILINEAR)
-                imgs.append(img)
-            except Exception:
-                imgs.append(None)
+            img_paths.append(img_path)
 
-        if any(im is None for im in imgs):
-            return None, None, {"skipped": "img_load_failed", "frame": int(frame_i)}
+        hs_last = pred_boxes = pred_scores = None
+        cache_dir = cfg.get("cache_dir", None)
+        if cache_dir is None and isinstance(cfg.get("cache", None), dict):
+            cache_dir = cfg.get("cache", {}).get("dir", None) or cfg.get("cache", {}).get("cache_dir", None)
+        if cache_dir is None:
+            cache_dir = os.environ.get("GDINO_CACHE_DIR", None)
+        if cache_dir is not None and all(isinstance(p, str) for p in img_paths) and all(isinstance(c, dict) for c in cams):
+            hw0 = cams[0].get("img_size_gdino", None)
+            if torch.is_tensor(hw0) and hw0.numel() == 2:
+                target_hw = (int(hw0.reshape(-1)[0].item()), int(hw0.reshape(-1)[1].item()))
+                bb_cfg = None
+                if isinstance(cfg.get("gdino", None), dict):
+                    bb_cfg = cfg["gdino"].get("backbone", None)
+                if not isinstance(bb_cfg, dict):
+                    bb_cfg = getattr(self, "_gdino_backbone_cfg", None)
+                cached = load_gdino_cache_batched(
+                    cache_dir,
+                    img_paths=[str(p) for p in img_paths],
+                    target_hw=target_hw,
+                    bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                    mode="full",
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if isinstance(cached, dict):
+                    hs_last = cached.get("hs_last", None)
+                    pred_boxes = cached.get("pred_boxes", None)
+                    pred_scores = cached.get("pred_scores", None)
 
-        img_t = torch.stack([self._to_tensor_img(im, device=device) for im in imgs], dim=0)
-        gdino = self._get_gdino_backbone(cfg.get("gdino", None))
-        out = gdino(img_t, backbone_only=False)
-        hs_last = out.get("hs_last", None)
-        pred_boxes = out.get("pred_boxes", None)
-        pred_scores = out.get("pred_scores", None)
+        if hs_last is None or pred_boxes is None or pred_scores is None:
+            imgs = []
+            for b in range(B):
+                cam = cams[b]
+                img_path = img_paths[b] if b < len(img_paths) else None
+                if cam is None or img_path is None:
+                    imgs.append(None)
+                    continue
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    img_size = cam.get("img_size_gdino", None)
+                    if torch.is_tensor(img_size):
+                        h1, w1 = int(img_size[0].item()), int(img_size[1].item())
+                        if (img.height, img.width) != (h1, w1):
+                            img = img.resize((w1, h1), resample=Image.BILINEAR)
+                    imgs.append(img)
+                except Exception:
+                    imgs.append(None)
+
+            if any(im is None for im in imgs):
+                return None, None, {"skipped": "img_load_failed", "frame": int(frame_i)}
+
+            img_t = torch.stack([self._to_tensor_img(im, device=device) for im in imgs], dim=0)
+            gdino = self._get_gdino_backbone(cfg.get("gdino", None))
+            out = gdino(img_t, backbone_only=False)
+            hs_last = out.get("hs_last", None)
+            pred_boxes = out.get("pred_boxes", None)
+            pred_scores = out.get("pred_scores", None)
         if hs_last is None or pred_boxes is None or pred_scores is None:
             return None, None, {"skipped": "gdino_no_outputs", "frame": int(frame_i)}
 
@@ -457,14 +557,17 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
             intr = cam.get("intrinsics", None)
             if isinstance(intr, (list, tuple)) and len(intr) == 1 and torch.is_tensor(intr[0]):
-                intr_t = intr[0].reshape(-1)[:4]
+                intr_t = intr[0].to(device=device, dtype=torch.float32).reshape(-1)[:4]
             elif torch.is_tensor(intr):
-                intr_t = intr.reshape(-1)[:4]
+                intr_t = intr.to(device=device, dtype=torch.float32).reshape(-1)[:4]
             else:
                 intr_t = torch.as_tensor(intr, device=device, dtype=torch.float32).reshape(-1)[:4]
             fx, fy, cx, cy = [float(v) for v in intr_t.tolist()]
             pose = cam.get("pose", cam.get("extrinsics", None))
-            pose_t = pose if torch.is_tensor(pose) else torch.as_tensor(pose, device=device, dtype=torch.float32).reshape(4, 4)
+            if torch.is_tensor(pose):
+                pose_t = pose.to(device=device, dtype=torch.float32).reshape(4, 4)
+            else:
+                pose_t = torch.as_tensor(pose, device=device, dtype=torch.float32).reshape(4, 4)
             img_hw = cam.get("img_size_gdino", None)
             if torch.is_tensor(img_hw):
                 h_img, w_img = int(img_hw[0].item()), int(img_hw[1].item())
@@ -554,6 +657,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             y1 = (cyn + 0.5 * hn) * float(h_img)
 
             q_pos_acc, q_feat_acc = [], []
+            support_counts = []
+            box_areas = []
             for qi in range(nq_keep):
                 in_box = (
                     valid_z
@@ -563,7 +668,13 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     & (uv_img[:, 1] <= y1[qi])
                 )
                 idx = torch.nonzero(in_box, as_tuple=False).squeeze(-1)
-                if idx.numel() == 0:
+                cnt = int(idx.numel())
+                support_counts.append(cnt)
+                try:
+                    box_areas.append(float(((x1[qi] - x0[qi]) * (y1[qi] - y0[qi])).abs().item()))
+                except Exception:
+                    box_areas.append(0.0)
+                if cnt < min_support:
                     continue
                 q_pos_acc.append(xyz_aug[idx].median(dim=0).values)
                 q_feat_acc.append(hs_keep[qi])
@@ -577,6 +688,16 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             q2d_pos_list.append(torch.stack(q_pos_acc, dim=0))
             nq_pos_list.append(int(len(q_pos_acc)))
 
+            # Aggregate support stats across batch for diagnostics.
+            try:
+                if "support_counts_all" not in locals():
+                    support_counts_all = []
+                    box_areas_all = []
+                support_counts_all.extend([int(x) for x in support_counts])
+                box_areas_all.extend([float(x) for x in box_areas])
+            except Exception:
+                pass
+
         stats = {
             "frame": int(frame_i),
             "valid_ratio_mean": float(np.mean(valid_ratios)) if valid_ratios else 0.0,
@@ -586,6 +707,31 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             "nq_keep_mean": float(np.mean(nq_keep_list)) if nq_keep_list else 0.0,
             "nq_pos_mean": float(np.mean(nq_pos_list)) if nq_pos_list else 0.0,
         }
+
+        # ---- support stats (in-box support points per 2D box) ----
+        try:
+            sc = np.asarray(locals().get("support_counts_all", []), dtype=np.float32)
+            ba = np.asarray(locals().get("box_areas_all", []), dtype=np.float32)
+            if sc.size > 0:
+                stats.update(
+                    {
+                        "min_support": int(min_support),
+                        "support_p50": float(np.percentile(sc, 50)),
+                        "support_p90": float(np.percentile(sc, 90)),
+                        "support_lt_min_rate": float(np.mean(sc < float(min_support))),
+                        "box_area_p50": float(np.percentile(ba, 50)) if ba.size > 0 else 0.0,
+                        "box_area_p90": float(np.percentile(ba, 90)) if ba.size > 0 else 0.0,
+                        "big_box_thr": float(big_box_thr),
+                    }
+                )
+                if ba.size == sc.size and ba.size > 0:
+                    big = ba >= float(big_box_thr)
+                    stats["big_box_rate"] = float(np.mean(big)) if big.size > 0 else 0.0
+                    stats["big_box_low_support_rate"] = float(
+                        np.mean((sc < float(min_support)) & big)
+                    ) if np.any(big) else 0.0
+        except Exception:
+            pass
         log_every = int(cfg.get("log_valid_every", 50))
         seen = int(getattr(self, "_gdino_daca2d_seen", 0))
         if log_every > 0 and (seen % log_every == 0):
@@ -593,7 +739,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 f"[GDINO][daca2d][valid_ratio] frame={int(frame_i)} "
                 f"mean={stats['valid_ratio_mean']:.4f} min={stats['valid_ratio_min']:.4f} "
                 f"qpos_rate_mean={stats['qpos_rate_mean']:.4f} qpos_rate_min={stats['qpos_rate_min']:.4f} "
-                f"nq_keep_mean={stats['nq_keep_mean']:.1f} nq_pos_mean={stats['nq_pos_mean']:.1f}"
+                f"nq_keep_mean={stats['nq_keep_mean']:.1f} nq_pos_mean={stats['nq_pos_mean']:.1f} "
+                f"support_p50={stats.get('support_p50', 0.0):.1f} support_p90={stats.get('support_p90', 0.0):.1f} "
+                f"lt_min={stats.get('support_lt_min_rate', 0.0):.3f} "
+                f"big_low={stats.get('big_box_low_support_rate', 0.0):.3f}"
             )
         self._gdino_daca2d_seen = seen + 1
         return q2d_feats_list, q2d_pos_list, stats
@@ -720,10 +869,30 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         # apply scatter_mean
         sp_pts_masks, n_super_points = [], []
         for data_sample in batch_data_samples:
-            sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask # [20000, 96]
+            sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
+            # Robustness: compact possibly gappy superpoint ids to [0..N-1]
+            # so scatter ops don't allocate by a huge max().
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks)
+
+        # Precompute SP positions in elastic space (used by bbox losses / box-CA3D).
+        # This must be consistent with the backbone/decoder space: elastic_coords*voxel_size if present, else points[:,:3].
+        try:
+            xyz_elastic = torch.cat(all_xyz, dim=0)
+            sp_xyz_elastic = scatter_mean(xyz_elastic, sp_idx, dim=0)
+            sp_pos_elastic_list = []
+            start = 0
+            for n_sp in n_super_points:
+                end = start + int(n_sp)
+                sp_pos_elastic_list.append(sp_xyz_elastic[start:end])
+                start = end
+            self._last_sp_pos_elastic_list = sp_pos_elastic_list
+        except Exception:
+            self._last_sp_pos_elastic_list = None
+
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
 
         # Precompute SP positions in wo-elastic space for DACA-2D distance gating.
@@ -781,48 +950,83 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             gt_point.p_masks = ins
             gt_point_instances.append(gt_point)
 
-        # Optional: compute GT axis-aligned bboxes on-the-fly (SV infos often omit bboxes_3d).
-        # This is only used when enabled explicitly in config (e.g., SegDINO3D-style costs/loss).
+        # Optional: compute GT axis-aligned bboxes/centers/sizes + scene_range on-the-fly
+        # (SV infos often omit bboxes_3d). This is only used when enabled explicitly in config.
+        self._last_scene_range = None
         try:
             if isinstance(self.train_cfg, dict) and bool(self.train_cfg.get('compute_gt_bboxes_3d', False)):
+                scene_range = []
                 for b in range(len(gt_instances)):
-                    if hasattr(gt_instances[b], 'bboxes_3d') and gt_instances[b].bboxes_3d is not None:
-                        continue
                     masks = gt_point_instances[b].p_masks  # (n_inst, n_pts)
-                    if masks.numel() == 0:
-                        gt_instances[b].bboxes_3d = torch.zeros((0, 7), device=x[b].device, dtype=torch.float32)
-                        continue
-                    # Use the same xyz space as model features (elastic coords if present).
+                    device = x[b].device
+                    # Use the same xyz space as decoder/box losses (elastic coords if present).
                     if 'elastic_coords' in batch_inputs_dict and batch_inputs_dict['elastic_coords'] is not None:
-                        xyz = batch_inputs_dict['elastic_coords'][b].to(x[b].device) * float(self.voxel_size)
+                        xyz = batch_inputs_dict['elastic_coords'][b].to(device) * float(self.voxel_size)
                     else:
-                        xyz = batch_inputs_dict['points'][b][:, :3].to(x[b].device)
-                    bboxes = []
-                    for mi in range(masks.shape[0]):
-                        idx = torch.nonzero(masks[mi], as_tuple=False).squeeze(-1)
-                        if idx.numel() == 0:
-                            bboxes.append(torch.zeros((7,), device=xyz.device, dtype=torch.float32))
-                            continue
-                        pts = xyz[idx]
-                        pmin = pts.min(dim=0).values
-                        pmax = pts.max(dim=0).values
-                        center = (pmin + pmax) * 0.5
-                        size = (pmax - pmin).clamp(min=0)
-                        bboxes.append(torch.cat([center, size, torch.zeros((1,), device=xyz.device, dtype=torch.float32)], dim=0))
-                    bboxes = torch.stack(bboxes, dim=0)  # (n_inst, 7)
-                    # Pad to match gt_instances[b].sp_masks rows (instances + semantic rows)
+                        xyz = batch_inputs_dict['points'][b][:, :3].to(device)
+
+                    # Scene range for positional encoding normalization.
+                    if xyz.numel() == 0:
+                        smin = torch.zeros((3,), device=device, dtype=torch.float32)
+                        smax = torch.ones((3,), device=device, dtype=torch.float32)
+                    else:
+                        smin = xyz.min(dim=0).values
+                        smax = xyz.max(dim=0).values
+                    scene_range.append((smin, smax))
+
+                    n_inst = int(masks.shape[0]) if masks.ndim == 2 else 0
+                    if n_inst == 0 or xyz.numel() == 0:
+                        bboxes = torch.zeros((0, 7), device=device, dtype=torch.float32)
+                        centers = torch.zeros((0, 3), device=device, dtype=torch.float32)
+                        sizes = torch.zeros((0, 3), device=device, dtype=torch.float32)
+                    else:
+                        b_list, c_list, s_list = [], [], []
+                        for mi in range(n_inst):
+                            idx = torch.nonzero(masks[mi], as_tuple=False).squeeze(-1)
+                            if idx.numel() == 0:
+                                c = torch.zeros((3,), device=device, dtype=torch.float32)
+                                sz = torch.zeros((3,), device=device, dtype=torch.float32)
+                            else:
+                                pts = xyz[idx]
+                                pmin = pts.min(dim=0).values
+                                pmax = pts.max(dim=0).values
+                                c = (pmin + pmax) * 0.5
+                                sz = (pmax - pmin).clamp(min=0)
+                            b_list.append(torch.cat([c, sz, torch.zeros((1,), device=device, dtype=torch.float32)], dim=0))
+                            c_list.append(c)
+                            s_list.append(sz)
+                        bboxes = torch.stack(b_list, dim=0)  # (n_inst, 7)
+                        centers = torch.stack(c_list, dim=0)
+                        sizes = torch.stack(s_list, dim=0)
+
+                    # Pad to match sp_masks rows (instances + semantic rows), keep naming aligned to SegDINO3D.
                     try:
                         n_rows = int(gt_instances[b].sp_masks.shape[0])
                     except Exception:
                         n_rows = int(bboxes.shape[0])
                     if n_rows > bboxes.shape[0]:
-                        pad = torch.zeros((n_rows - bboxes.shape[0], 7), device=bboxes.device, dtype=bboxes.dtype)
-                        bboxes = torch.cat([bboxes, pad], dim=0)
-                    gt_instances[b].bboxes_3d = bboxes
-        except Exception:
-            pass
+                        pad7 = torch.zeros((n_rows - bboxes.shape[0], 7), device=device, dtype=bboxes.dtype)
+                        bboxes = torch.cat([bboxes, pad7], dim=0)
+                        pad3 = torch.zeros((n_rows - centers.shape[0], 3), device=device, dtype=centers.dtype)
+                        centers = torch.cat([centers, pad3], dim=0)
+                        sizes = torch.cat([sizes, pad3], dim=0)
 
-        queries, gt_instances = self._select_queries(x, gt_instances) # 随机选出 0.5 ~ 1数量的query
+                    # Only overwrite if missing to avoid clobbering dataset-provided boxes.
+                    if not (hasattr(gt_instances[b], 'bboxes_3d') and gt_instances[b].bboxes_3d is not None):
+                        gt_instances[b].bboxes_3d = bboxes
+                    gt_instances[b].instance_centers = centers
+                    gt_instances[b].instance_sizes = sizes
+
+                self._last_scene_range = scene_range
+        except Exception:
+            self._last_scene_range = None
+
+        # Select queries and keep query centers aligned (needed by bbox losses / Center&Size costs).
+        sp_pos_elastic_list = getattr(self, "_last_sp_pos_elastic_list", None)
+        if sp_pos_elastic_list is not None:
+            queries, gt_instances, sp_pos_elastic_list = self._select_queries(x, gt_instances, sp_pos_elastic_list)
+        else:
+            queries, gt_instances = self._select_queries(x, gt_instances) # 随机选出 0.5 ~ 1数量的query
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w) # 每个点的segment ID以及归一化权重
 
@@ -849,8 +1053,12 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             x, point_features, queries, super_points, use_one2many=self.use_one2many,
             query2d_feats=query2d_feats, query2d_pos=query2d_pos, gdino_daca2d_cfg=gdino_daca2d_cfg,
             sp_pos_list_override=getattr(self, '_last_sp_pos_wo_elastic_list', None),
+            # Box-modulated CA-3D (optional): needs elastic SP positions + scene range in the same space.
+            sp_pos_list_elastic=sp_pos_elastic_list,
+            scene_range=getattr(self, "_last_scene_range", None),
+            query3d_pos=sp_pos_elastic_list,
         ) # [N_segment, 96] [20000, 99] [(0.5 ~ 1) * N_segment, 96] ([20000, 1])
-        loss = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
+        loss = self.criterion(x, gt_instances, gt_point_instances, sp_pos_elastic_list, self.decoder.mask_pred_mode)
         if self.use_one2many:
             loss_one2many = self.criterion_one2many(x['one2many_outputs'], gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode, use_one2many=self.use_one2many)
             for key, value in loss_one2many.items():
@@ -910,6 +1118,56 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         ## Post-processing
         pred_pts_seg = self.predict_by_feat(
             x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
+        # Optional: lightweight per-scene monitor for SV (mirrors Online class structure).
+        try:
+            mon_cfg = (self.test_cfg.get('online_monitor', None) or {}) if hasattr(self, 'test_cfg') else {}
+            if bool(mon_cfg.get('enable', False)):
+                meta = getattr(batch_data_samples[0], 'img_metas', None)
+                if not isinstance(meta, dict):
+                    try:
+                        meta = batch_data_samples[0].metainfo
+                    except Exception:
+                        meta = {}
+                scene_id = (
+                    meta.get('scene_id', None)
+                    or meta.get('scan_id', None)
+                    or meta.get('sample_idx', None)
+                    or meta.get('lidar_idx', None)
+                    or meta.get('ann_file', None)
+                    or meta.get('pts_filename', None)
+                    or 'unknown'
+                )
+                fr = {'frame': 0}
+                if isinstance(getattr(self, '_last_gdino_daca2d_stats', None), dict):
+                    fr['gdino_daca2d'] = self._last_gdino_daca2d_stats
+                if isinstance(getattr(self, '_last_gdino_point_fusion_stats', None), dict):
+                    fr['gdino'] = self._last_gdino_point_fusion_stats
+                try:
+                    st = getattr(self.decoder, '_last_daca2d_apply_stats', None)
+                    if isinstance(st, dict) and isinstance(st.get('agg', None), dict):
+                        agg = st['agg']
+                        nq2d = float(agg.get('nq2d_mean', 0.0) or 0.0)
+                        allowed_mean = float(agg.get('allowed_q2d_mean', 0.0) or 0.0)
+                        fr['daca2d_apply'] = {
+                            'allowed_zero_rate': float(agg.get('allowed_q2d_zero_rate', 0.0) or 0.0),
+                            'allowed_q2d_mean': allowed_mean,
+                            'allowed_q2d_p50': float(agg.get('allowed_q2d_p50', 0.0) or 0.0),
+                            'allowed_q2d_p90': float(agg.get('allowed_q2d_p90', 0.0) or 0.0),
+                            'nq2d': nq2d,
+                            'nq3d': float(agg.get('nq3d_mean', 0.0) or 0.0),
+                            'density': float(allowed_mean / (nq2d + 1e-6)) if nq2d > 0 else 0.0,
+                            'delta_rel_mean': float(agg.get('delta_rel_mean', 0.0) or 0.0),
+                            'q2d_any_sp_rate': float(agg.get('q2d_any_sp_rate', 0.0) or 0.0),
+                        }
+                except Exception:
+                    pass
+                pred_pts_seg[0].online_monitor = {
+                    'scene_id': str(scene_id),
+                    'num_frames': 1,
+                    'frames': [fr],
+                }
+        except Exception:
+            pass
         batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
         return batch_data_samples
     
@@ -1096,8 +1354,10 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         sp_pts_masks, n_super_points = [], []
         for data_sample in batch_data_samples:
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks)
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
 
@@ -1664,8 +1924,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             )
 
         B = len(batch_data_samples)
-        # Collect per-sample image tensors and GDINO meta (intr/pose/img size).
-        img_t_list = []
+        # Collect per-sample GDINO meta (intr/pose/img size).
         per_intr = []
         per_pose = []
         per_hw = []
@@ -1774,35 +2033,69 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             per_xyz_aug.append(xyz_aug)
             per_xyz_proj.append(xyz_proj)
 
-            # Load image and ensure size matches cam_info.
-            try:
-                img = Image.open(img_path).convert("RGB")
-                if img.size != (w_img, h_img):
-                    img = img.resize((w_img, h_img), resample=Image.BILINEAR)
-                # np.asarray(PIL.Image) may return a non-writable view; copy to avoid undefined behavior warning.
-                img_t = torch.from_numpy(np.asarray(img).copy()).to(device=xyz_aug.device).float() / 255.0
-                img_t = img_t.permute(2, 0, 1)
-            except Exception:
-                return _skip("img_load_failed", sample=int(b))
-            img_t_list.append(img_t)
+        hs_last = pred_boxes = pred_scores = None
+        cache_dir = cfg.get("cache_dir", None)
+        if cache_dir is None and isinstance(cfg.get("cache", None), dict):
+            cache_dir = cfg.get("cache", {}).get("dir", None) or cfg.get("cache", {}).get("cache_dir", None)
+        if cache_dir is None:
+            cache_dir = os.environ.get("GDINO_CACHE_DIR", None)
 
-        # Stack images and run GDINO full forward once.
-        img_batch = torch.stack(img_t_list, dim=0)
-        try:
-            gdino = self._get_gdino_backbone(cfg)
-            with torch.no_grad():
-                out = gdino(img_batch, backbone_only=False)
-            hs_last = out.get("hs_last", None)
-            pred_boxes = out.get("pred_boxes", None)
-            pred_scores = out.get("pred_scores", None)
-        except Exception:
-            return _skip("gdino_failed")
+        if cache_dir is not None and per_img_path:
+            target_hw = per_hw[0]
+            if all(h == target_hw for h in per_hw):
+                bb_cfg = cfg.get("backbone", None) if isinstance(cfg, dict) else None
+                if not isinstance(bb_cfg, dict):
+                    bb_cfg = getattr(self, "_gdino_backbone_cfg", None)
+                cached = load_gdino_cache_batched(
+                    cache_dir,
+                    img_paths=per_img_path,
+                    target_hw=target_hw,
+                    bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                    mode="full",
+                    device=per_xyz_aug[0].device,
+                    dtype=torch.float32,
+                )
+                if isinstance(cached, dict):
+                    hs_last = cached.get("hs_last", None)
+                    pred_boxes = cached.get("pred_boxes", None)
+                    pred_scores = cached.get("pred_scores", None)
+
         if hs_last is None or pred_boxes is None or pred_scores is None:
-            return _skip("gdino_missing")
+            img_t_list = []
+            for b in range(B):
+                img_path = per_img_path[b]
+                h_img, w_img = per_hw[b]
+                device_b = per_xyz_aug[b].device
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    if img.size != (w_img, h_img):
+                        img = img.resize((w_img, h_img), resample=Image.BILINEAR)
+                    img_t = torch.from_numpy(np.asarray(img).copy()).to(device=device_b).float() / 255.0
+                    img_t = img_t.permute(2, 0, 1)
+                except Exception:
+                    return _skip("img_load_failed", sample=int(b))
+                img_t_list.append(img_t)
+
+            img_batch = torch.stack(img_t_list, dim=0)
+            try:
+                gdino = self._get_gdino_backbone(cfg)
+                with torch.no_grad():
+                    out = gdino(img_batch, backbone_only=False)
+                hs_last = out.get("hs_last", None)
+                pred_boxes = out.get("pred_boxes", None)
+                pred_scores = out.get("pred_scores", None)
+            except Exception:
+                return _skip("gdino_failed")
+            if hs_last is None or pred_boxes is None or pred_scores is None:
+                return _skip("gdino_missing")
 
         # Per-sample build q_feats/q_pos.
         score_thr = float(cfg.get("score_thr", 0.05))
         max_queries = int(cfg.get("max_queries", 300))
+        select_mode = str(cfg.get("select_mode", "score_thr")).lower()
+        qpos_ds_cfg = cfg.get("qpos_downsample", {}) if isinstance(cfg, dict) else {}
+        qpos_ds_voxel = float(qpos_ds_cfg.get("voxel_size", 0.3))
+        qpos_ds_pre_topk = int(qpos_ds_cfg.get("pre_topk", max_queries * 4))
         min_support = int(cfg.get("query3d_center", {}).get("min_support_pts", 30))
 
         q_feats_list, q_pos_list = [], []
@@ -1877,14 +2170,24 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             boxes_b = pred_boxes[b]
             scores_b = pred_scores[b]
             nq_raw = int(boxes_b.shape[0])
-            keep = scores_b >= score_thr
-            if keep.any():
-                keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
-                if keep_idx.numel() > max_queries:
-                    topk = torch.topk(scores_b[keep_idx], k=max_queries, largest=True).indices
-                    keep_idx = keep_idx[topk]
-            else:
+            # ---- query selection (score_thr / fixed top-k / qpos coverage downsample) ----
+            if nq_raw <= 0:
                 keep_idx = scores_b.new_zeros((0,), dtype=torch.long)
+            elif select_mode == "topk":
+                k = min(max_queries, nq_raw)
+                keep_idx = torch.topk(scores_b, k=k, largest=True).indices
+            elif select_mode == "qpos_voxel":
+                k = min(max(qpos_ds_pre_topk, max_queries), nq_raw)
+                keep_idx = torch.topk(scores_b, k=k, largest=True).indices
+            else:
+                keep = scores_b >= score_thr
+                if keep.any():
+                    keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+                    if keep_idx.numel() > max_queries:
+                        topk = torch.topk(scores_b[keep_idx], k=max_queries, largest=True).indices
+                        keep_idx = keep_idx[topk]
+                else:
+                    keep_idx = scores_b.new_zeros((0,), dtype=torch.long)
 
             q_feats = hs_b[keep_idx]
             q_boxes = boxes_b[keep_idx]
@@ -1905,17 +2208,55 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             v = uv_img[:, 1]
             q_pos_keep = []
             q_feat_keep = []
+            q_score_keep = []
             support_counts = []
+            box_areas = []
             for j in range(nq_keep):
                 in_box = (u >= x1[j]) & (u <= x2[j]) & (v >= y1[j]) & (v <= y2[j]) & valid_mask
                 # IMPORTANT: support selection uses raw projection (uv from xyz_proj),
                 # but q_pos must be in decoder distance space (wo-elastic xyz_aug).
                 support_pts = xyz_aug[in_box]
                 support_counts.append(int(support_pts.shape[0]))
+                try:
+                    box_areas.append(float(((x2[j] - x1[j]) * (y2[j] - y1[j])).item()))
+                except Exception:
+                    box_areas.append(0.0)
                 if support_pts.shape[0] < min_support:
                     continue
                 q_pos_keep.append(torch.median(support_pts, dim=0).values)
                 q_feat_keep.append(q_feats[j])
+                try:
+                    q_score_keep.append(scores_b[keep_idx[j]])
+                except Exception:
+                    pass
+
+            # Optional: qpos coverage downsample (SegDINO3D-style "provide O object-level features").
+            # We first keep a pre-topk by score (done above), then voxel-grid downsample by qpos.
+            if select_mode == "qpos_voxel" and len(q_pos_keep) > 0 and len(q_score_keep) == len(q_pos_keep):
+                try:
+                    q_pos_tmp = torch.stack(q_pos_keep, dim=0)
+                    q_feat_tmp = torch.stack(q_feat_keep, dim=0)
+                    q_score_tmp = torch.stack(q_score_keep, dim=0).float()
+                    vox = torch.floor(q_pos_tmp / max(qpos_ds_voxel, 1e-6)).to(torch.int64)
+                    uniq, inv = torch.unique(vox, dim=0, return_inverse=True)
+                    pick = []
+                    for u_id in range(int(uniq.shape[0])):
+                        inds = torch.nonzero(inv == u_id, as_tuple=False).squeeze(-1)
+                        if inds.numel() == 1:
+                            pick.append(int(inds.item()))
+                        else:
+                            pick.append(int(inds[q_score_tmp[inds].argmax()].item()))
+                    pick = torch.as_tensor(pick, device=q_pos_tmp.device, dtype=torch.long)
+                    if pick.numel() > max_queries:
+                        topk = torch.topk(q_score_tmp[pick], k=max_queries, largest=True).indices
+                        pick = pick[topk]
+                    order = torch.argsort(q_score_tmp[pick], descending=True)
+                    pick = pick[order]
+                    q_pos_keep = [q_pos_tmp[i] for i in pick.tolist()]
+                    q_feat_keep = [q_feat_tmp[i] for i in pick.tolist()]
+                    q_score_keep = [q_score_tmp[i] for i in pick.tolist()]
+                except Exception:
+                    pass
 
             if len(q_pos_keep) == 0:
                 q_pos = xyz_aug.new_zeros((0, 3))
@@ -1929,6 +2270,16 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
             q_feats_list.append(q_feat)
             q_pos_list.append(q_pos)
+
+            # Aggregate support stats across batch for diagnostics.
+            try:
+                if "support_counts_all" not in locals():
+                    support_counts_all = []
+                    box_areas_all = []
+                support_counts_all.extend([int(x) for x in support_counts])
+                box_areas_all.extend([float(x) for x in box_areas])
+            except Exception:
+                pass
 
         # ---- stats (for monitor/diagnostics) ----
         qpos_rates = []
@@ -1949,6 +2300,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         stats = {
             "frame": int(frame_i),
             "batch": int(B),
+            "select_mode": str(select_mode),
             "valid_ratio_mean": float(np.mean(valid_ratios)) if valid_ratios else 0.0,
             "valid_ratio_min": float(np.min(valid_ratios)) if valid_ratios else 0.0,
             "nq_keep_mean": float(np.mean(nq_keeps)) if nq_keeps else 0.0,
@@ -1964,6 +2316,42 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             "nq_pos_p50": _pctl(nq_pos_list, 50),
             "nq_pos_p90": _pctl(nq_pos_list, 90),
         }
+
+        # ---- support stats (in-box support points per 2D box) ----
+        # These diagnose whether nq_pos is limited by point sparsity, tiny boxes, or projection mismatch.
+        try:
+            support_cfg = cfg.get("support_stats", {}) if isinstance(cfg, dict) else {}
+            big_box_thr = float(support_cfg.get("big_box_area_px", 10000.0))
+        except Exception:
+            big_box_thr = 10000.0
+
+        try:
+            sc = np.asarray(locals().get("support_counts_all", []), dtype=np.float32)
+            ba = np.asarray(locals().get("box_areas_all", []), dtype=np.float32)
+            if sc.size > 0:
+                stats.update(
+                    {
+                        "support_p50": float(np.percentile(sc, 50)),
+                        "support_p90": float(np.percentile(sc, 90)),
+                        "support_lt_min_rate": float(np.mean(sc < float(min_support))),
+                        "box_area_p50": float(np.percentile(ba, 50)) if ba.size > 0 else 0.0,
+                        "box_area_p90": float(np.percentile(ba, 90)) if ba.size > 0 else 0.0,
+                        "big_box_thr": float(big_box_thr),
+                    }
+                )
+                if ba.size == sc.size and ba.size > 0:
+                    big = ba >= float(big_box_thr)
+                    if np.any(big):
+                        stats["big_box_rate"] = float(np.mean(big))
+                        stats["big_box_low_support_rate"] = float(
+                            np.mean((sc < float(min_support)) & big)
+                        )
+                    else:
+                        stats["big_box_rate"] = 0.0
+                        stats["big_box_low_support_rate"] = 0.0
+        except Exception:
+            pass
+
         log_every = int(cfg.get("log_valid_every", 0))
         if (log_every > 0 and (seen % log_every == 0)) or (log_first and seen == 0):
             _log(
@@ -1971,7 +2359,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 f"mean={stats['valid_ratio_mean']:.4f} min={stats['valid_ratio_min']:.4f} "
                 f"qpos_rate_mean={stats['query_pos_valid_rate_mean']:.4f} "
                 f"qpos_rate_min={stats['qpos_rate_min']:.4f} "
-                f"nq_keep_mean={stats['nq_keep_mean']:.1f} nq_pos_mean={stats['nq_pos_mean']:.1f}"
+                f"nq_keep_mean={stats['nq_keep_mean']:.1f} nq_pos_mean={stats['nq_pos_mean']:.1f} "
+                f"support_p50={stats.get('support_p50', 0.0):.1f} support_p90={stats.get('support_p90', 0.0):.1f} "
+                f"lt_min={stats.get('support_lt_min_rate', 0.0):.3f} "
+                f"big_low={stats.get('big_box_low_support_rate', 0.0):.3f}"
             )
         self._gdino_daca2d_seen = seen + 1
         return q_feats_list, q_pos_list, stats
@@ -2024,13 +2415,31 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         max_depth = float(cfg.get("max_depth", 10.0))
         strict = bool(cfg.get("strict", False))
         strict_thr = float(cfg.get("strict_valid_ratio", 0.95))
+        cache_dir = cfg.get("cache_dir", None)
+        if cache_dir is None and isinstance(cfg.get("cache", None), dict):
+            cache_dir = cfg.get("cache", {}).get("dir", None) or cfg.get("cache", {}).get("cache_dir", None)
+        if cache_dir is None:
+            cache_dir = os.environ.get("GDINO_CACHE_DIR", None)
 
+        gdino_init_err = None
         try:
             gdino = self._get_gdino_backbone(cfg.get("gdino", None))
-        except Exception:
+        except Exception as e:
             gdino = None
+            gdino_init_err = repr(e)
         if gdino is None:
-            return None, {"skipped": "gdino_missing", "frame": int(frame_i)}
+            err = {"skipped": "gdino_missing", "frame": int(frame_i)}
+            if gdino_init_err is not None:
+                err["gdino_init_error"] = gdino_init_err
+            try:
+                import torch as _torch
+                err["cuda_available"] = bool(_torch.cuda.is_available())
+                err["cuda_device_count"] = int(_torch.cuda.device_count())
+            except Exception:
+                pass
+            if bool(cfg.get("log_fail", False)):
+                _log(f"[GDINO][point_fusion][error] frame={int(frame_i)} err={err}")
+            return None, err
 
         pts_raw_in = batch_inputs_dict.get("points_raw", None)
         pts_aug_in = batch_inputs_dict.get("points", None)
@@ -2205,34 +2614,77 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 if xyz is None:
                     xyz = xyz_aug
 
-            # Load image (resized to img_size_gdino; enforce as safety net).
-            try:
-                img = Image.open(img_path).convert("RGB")
-                if img.size != (w_img, h_img):
-                    img = img.resize((w_img, h_img), resample=Image.BILINEAR)
-                img_t = torch.from_numpy(np.array(img, copy=True)).to(device=device).float() / 255.0
-                img_t = img_t.permute(2, 0, 1).unsqueeze(0)
-            except Exception:
-                out_feats.append(None)
-                valid_ratios.append(0.0)
-                continue
+            feat_map = None
+            feat_h = feat_w = None
+            if cache_dir is not None:
+                bb_cfg = cfg.get("backbone", None) if isinstance(cfg, dict) else None
+                if not isinstance(bb_cfg, dict):
+                    bb_cfg = getattr(self, "_gdino_backbone_cfg", None)
+                cached = load_gdino_cache_single(
+                    cache_dir,
+                    img_path=img_path,
+                    target_hw=(int(h_img), int(w_img)),
+                    bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                    mode="full",
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if isinstance(cached, dict):
+                    srcs = cached.get("srcs", None)
+                    if isinstance(srcs, list) and len(srcs) > 0:
+                        level = max(0, min(int(feat_level), len(srcs) - 1))
+                        feat_map = srcs[level]
+                        if torch.is_tensor(feat_map) and feat_map.dim() == 4:
+                            feat_h = int(feat_map.shape[-2])
+                            feat_w = int(feat_map.shape[-1])
+                if feat_map is None:
+                    cached = load_gdino_cache_single(
+                        cache_dir,
+                        img_path=img_path,
+                        target_hw=(int(h_img), int(w_img)),
+                        bb_cfg=bb_cfg if isinstance(bb_cfg, dict) else None,
+                        mode="backbone",
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    if isinstance(cached, dict):
+                        srcs = cached.get("srcs", None)
+                        if isinstance(srcs, list) and len(srcs) > 0:
+                            level = max(0, min(int(feat_level), len(srcs) - 1))
+                            feat_map = srcs[level]
+                            if torch.is_tensor(feat_map) and feat_map.dim() == 4:
+                                feat_h = int(feat_map.shape[-2])
+                                feat_w = int(feat_map.shape[-1])
 
-            # GDINO backbone_only forward -> srcs
-            try:
-                out = gdino(img_t, backbone_only=True)
-                srcs = out.get("srcs", None)
-                if not isinstance(srcs, list) or len(srcs) == 0:
-                    raise RuntimeError("no_srcs")
-                level = max(0, min(int(feat_level), len(srcs) - 1))
-                feat_map = srcs[level]
-                if feat_map.dim() != 4:
-                    raise RuntimeError("bad_feat_map")
-                feat_h = int(feat_map.shape[-2])
-                feat_w = int(feat_map.shape[-1])
-            except Exception:
-                out_feats.append(None)
-                valid_ratios.append(0.0)
-                continue
+            if feat_map is None:
+                # Load image (resized to img_size_gdino; enforce as safety net).
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    if img.size != (w_img, h_img):
+                        img = img.resize((w_img, h_img), resample=Image.BILINEAR)
+                    img_t = torch.from_numpy(np.array(img, copy=True)).to(device=device).float() / 255.0
+                    img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+                except Exception:
+                    out_feats.append(None)
+                    valid_ratios.append(0.0)
+                    continue
+
+                # GDINO backbone_only forward -> srcs
+                try:
+                    out = gdino(img_t, backbone_only=True)
+                    srcs = out.get("srcs", None)
+                    if not isinstance(srcs, list) or len(srcs) == 0:
+                        raise RuntimeError("no_srcs")
+                    level = max(0, min(int(feat_level), len(srcs) - 1))
+                    feat_map = srcs[level]
+                    if feat_map.dim() != 4:
+                        raise RuntimeError("bad_feat_map")
+                    feat_h = int(feat_map.shape[-2])
+                    feat_w = int(feat_map.shape[-1])
+                except Exception:
+                    out_feats.append(None)
+                    valid_ratios.append(0.0)
+                    continue
 
             # Auto-pick pose mode based on valid ratio on the feature grid.
             xyz_world = xyz
@@ -2416,6 +2868,37 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             pass
 
         use_gdino_fusion = bool(self.gdino_point_fusion_cfg.get("enable", False))
+
+        # Point-fusion mode control: when using sparse-FPN injection, do NOT concat features to backbone input.
+        fuse_mode = str(self.gdino_point_fusion_cfg.get("fuse_mode", "concat")).lower()
+        pf_mode = str(self.gdino_point_fusion_cfg.get("mode", "early")).lower()
+        if fuse_mode in ("fpn", "sparse_fpn"):
+            pf_mode = "fpn"
+
+        gdino_sparse_fpn = None
+        if use_gdino_fusion and pf_mode == "fpn":
+            ok = isinstance(gdino_point_feats, (list, tuple)) and len(gdino_point_feats) == len(batch_inputs_dict.get('points', []))
+            if not ok:
+                raise RuntimeError(
+                    "[GDINO][point_fusion] enabled but no per-point features were produced. "
+                    f"stats={gdino_point_stats}"
+                )
+            coords_list = []
+            feats_list = []
+            for b in range(len(batch_inputs_dict.get('points', []))):
+                if 'elastic_coords' in batch_inputs_dict:
+                    coord_src = batch_inputs_dict['elastic_coords'][b][frame_i] * self.voxel_size
+                else:
+                    coord_src = batch_inputs_dict['points'][b][frame_i, :, :3]
+                coords = torch.floor(coord_src / self.voxel_size).to(dtype=torch.int32)
+                batch_col = torch.full((coords.shape[0], 1), b, dtype=torch.int32, device=coords.device)
+                coords_batched = torch.cat([batch_col, coords], dim=1)
+                coords_list.append(coords_batched)
+                feats_list.append(gdino_point_feats[b].to(device=coords.device))
+            coords_batch = torch.cat(coords_list, dim=0) if coords_list else None
+            feats_batch = torch.cat(feats_list, dim=0) if feats_list else None
+            if coords_batch is not None and feats_batch is not None:
+                gdino_sparse_fpn = build_sparse_fpn(coords_batch, feats_batch)
         fusion_out_dim = 0
         if use_gdino_fusion:
             if self._gdino_point_proj is not None:
@@ -2447,7 +2930,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             except Exception:
                 coordinates_wo_elastic.append(coordinates[-1])
             rgb = batch_inputs_dict['points'][i][frame_i, :, 3:]
-            if use_gdino_fusion and fusion_out_dim > 0:
+            if use_gdino_fusion and fusion_out_dim > 0 and pf_mode != "fpn":
                 if gdino_point_feats is not None and i < len(gdino_point_feats) and gdino_point_feats[i] is not None:
                     try:
                         rgb = torch.cat(
@@ -2493,7 +2976,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         field = ME.TensorField(coordinates=coordinates, features=features) 
 
         # forward of backbone and neck
-        x = self.backbone(field.sparse(), memory=self.memory if hasattr(self,'memory') else None) # [13141, 96]
+        if gdino_sparse_fpn is not None:
+            try:
+                x = self.backbone(field.sparse(), dino_feats=gdino_sparse_fpn, memory=self.memory if hasattr(self,'memory') else None)
+            except TypeError:
+                x = self.backbone(field.sparse(), dino_feats=gdino_sparse_fpn)
+        else:
+            x = self.backbone(field.sparse(), memory=self.memory if hasattr(self,'memory') else None) # [13141, 96]
         if self.with_neck:
             x = self.neck(x)
         x = x.slice(field) # [20000, 96]
@@ -2502,10 +2991,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # apply scatter_mean
         sp_pts_masks, n_super_points = [], []
+        compact_sp_ids = []
         if self.use_temporal_loss and self.inst_dict is not None:
             best_obj_ids_list = []
         for batch_idx, (data_sample, tmp_xyz) in enumerate(zip(batch_data_samples, all_xyz)):
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask[frame_i].clone() # [20000] 每个点属于的segment ID
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
+            compact_sp_ids.append(sp_pts_mask)
             if self.use_temporal_loss and self.inst_dict is not None:
                 points_xyz = all_xyz[batch_idx]  # (N,3)
                 point_ids  = sp_pts_mask # (N,)dd
@@ -2521,7 +3014,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     bboxes_6d  = self.inst_dict['bboxes_3d'][batch_idx]  # (M,6)
 
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points)) # [20000] 每个点在所有点中的ID
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks) # [20000]
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True) # [N_segment, 96], [20000, 1]
 
@@ -2530,7 +3023,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         sp_pos_wo_list = []
         try:
             for batch_idx, data_sample in enumerate(batch_data_samples):
-                sp_id = data_sample.gt_pts_seg.sp_pts_mask[frame_i].to(all_xyz_wo_elastic[batch_idx].device)
+                sp_id = compact_sp_ids[batch_idx].to(all_xyz_wo_elastic[batch_idx].device)
                 xyz_wo = all_xyz_wo_elastic[batch_idx]
                 sp_pos_wo = scatter_mean(xyz_wo, sp_id, dim=0)
                 sp_pos_wo_list.append(sp_pos_wo)
@@ -2605,8 +3098,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         sp_pts_masks, n_super_points = [], []
         current_sp_pts_mask = [bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples]
         for sp_pts_mask in current_sp_pts_mask:
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks)
         x_pooled, all_xyz_w_orig = self.pool(x, sp_idx, all_xyz, with_xyz=True)
 
@@ -2787,8 +3282,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         sp_pts_masks_new, n_super_points_new = [], []
         for data_sample in batch_data_samples:
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask[frame_i]
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks_new.append(sp_pts_mask + sum(n_super_points_new))
-            n_super_points_new.append(sp_pts_mask.max() + 1)
+            n_super_points_new.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx_new = torch.cat(sp_pts_masks_new)
         x_pooled_new, all_xyz_w = self.pool(x, sp_idx_new, all_xyz, with_xyz=True)
         features_final, sp_xyz_list = [], []
@@ -3323,14 +3820,21 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w) 
             if self.use_mot:
                 if self.mot_type == 'dq_track' and self.asso_config.get('train_asso_only', True):
-                    with frozen_inference(self.decoder):
+                    # Default stage2 trains association only (decoder frozen under no_grad).
+                    # For finetuning new decoder-side modules (e.g. track-window STM),
+                    # allow overriding this behavior via `asso_config.freeze_decoder=False`.
+                    freeze_decoder = bool(self.asso_config.get('freeze_decoder', True))
+                    ctx = frozen_inference(self.decoder) if freeze_decoder else nullcontext()
+                    with ctx:
                         x = self.decoder(
                             x, point_features, queries, super_points,
                             use_temporal_loss=self.use_temporal_loss,
                             inst_dict=self.inst_dict if self.use_temporal_loss else None,
+                            track_instances=track_instances,
                             query2d_feats=query2d_feats, query2d_pos=query2d_pos,
                             gdino_daca2d_cfg=gdino_daca2d_cfg,
                             sp_pos_list_override=getattr(self, "_last_sp_pos_wo_elastic_list", None),
+                            query3d_pos=sp_xyz,
                         )
                 else:
                     raise NotImplementedError(f"mot_type {self.mot_type} and train_asso_only {self.asso_config.get('train_asso_only', True)} is not supported")
@@ -3340,9 +3844,11 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     use_temporal_loss=self.use_temporal_loss,
                     inst_dict=self.inst_dict if self.use_temporal_loss else None,
                     use_one2many=self.use_one2many,
+                    track_instances=track_instances if self.use_mot else None,
                     query2d_feats=query2d_feats, query2d_pos=query2d_pos,
                     gdino_daca2d_cfg=gdino_daca2d_cfg,
                     sp_pos_list_override=getattr(self, "_last_sp_pos_wo_elastic_list", None),
+                    query3d_pos=sp_xyz,
                 ) # ! 还是这里？
             if self.use_mot:          
                 untracked_tgt_indexes_list = []
@@ -3456,7 +3962,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                                 mask_tracks = torch.isin(track_inds, cols)                   # Bool Tensor, shape [num_tracks]
                                 track_index = torch.nonzero(mask_tracks, as_tuple=True)[0] 
                                 target_heatmap[i, track_index] = 1.0
-                            loss_rel_asso += self.heatmap_loss_fn(all_det2track_heatmap, target_heatmap)
+                            rel_w = float(self.asso_config.get('rel_asso_loss_weight', 1.0))
+                            loss_rel_asso += rel_w * self.heatmap_loss_fn(all_det2track_heatmap, target_heatmap)
 
                         
                         if valid_track.sum() > 0:
@@ -3783,11 +4290,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         active_queries_num = [len(q) for q in init_track_instances.queries]  # Set to 0 if queries is empty
             ## Decoder 
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w) # ([20000], [20000, 1])
+            # Optional: enable decoder-side diagnostics for track-window STM.
+            try:
+                trk_stm_mon = online_monitor_cfg.get("trk_stm", {}) if isinstance(online_monitor_cfg, dict) else {}
+                self.decoder._trk_stm_diag_collect = bool(trk_stm_mon.get("enable", False)) and online_monitor_enable
+            except Exception:
+                pass
             x = self.decoder(
                 x, point_features, x, super_points,
+                track_instances=track_instances if self.use_mot else None,
                 query2d_feats=query2d_feats, query2d_pos=query2d_pos,
                 gdino_daca2d_cfg=gdino_daca2d_cfg,
                 sp_pos_list_override=getattr(self, "_last_sp_pos_wo_elastic_list", None),
+                query3d_pos=sp_xyz,
             ) # [N_segment, 96] [20000, 99] [N_segment, 96] ([20000], [20000, 1])
             ## Post-processing
             if online_monitor_enable:
@@ -4013,6 +4528,36 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     # GDINO per-point 2D feature fusion diagnostics (image-level srcs -> point feats)
                     if isinstance(getattr(self, "_last_gdino_point_fusion_stats", None), dict):
                         fr["gdino_point_fusion"] = self._last_gdino_point_fusion_stats
+                    # Decoder-side DACA-2D apply stats (gate sparsity; helps diagnose whether injection is near no-op).
+                    try:
+                        st = getattr(self.decoder, '_last_daca2d_apply_stats', None)
+                        if isinstance(st, dict):
+                            agg = st.get('agg', None) if isinstance(st.get('agg', None), dict) else None
+                            if isinstance(agg, dict):
+                                nq2d = float(agg.get('nq2d_mean', 0.0) or 0.0)
+                                allowed_mean = float(agg.get('allowed_q2d_mean', 0.0) or 0.0)
+                                fr['daca2d_apply'] = {
+                                    'allowed_zero_rate': float(agg.get('allowed_q2d_zero_rate', 0.0) or 0.0),
+                                    'allowed_q2d_mean': allowed_mean,
+                                    'allowed_q2d_p50': float(agg.get('allowed_q2d_p50', 0.0) or 0.0),
+                                    'allowed_q2d_p90': float(agg.get('allowed_q2d_p90', 0.0) or 0.0),
+                                    'nq2d': nq2d,
+                                    'nq3d': float(agg.get('nq3d_mean', 0.0) or 0.0),
+                                    'density': float(allowed_mean / (nq2d + 1e-6)) if nq2d > 0 else 0.0,
+                                    'delta_rel_mean': float(agg.get('delta_rel_mean', 0.0) or 0.0),
+                                    'q2d_any_sp_rate': float(agg.get('q2d_any_sp_rate', 0.0) or 0.0),
+                                }
+                    except Exception:
+                        pass
+                    # Decoder-side track-window STM apply stats.
+                    try:
+                        trk_stm_mon = online_monitor_cfg.get("trk_stm", {}) if isinstance(online_monitor_cfg, dict) else {}
+                        if bool(trk_stm_mon.get("enable", False)):
+                            st = getattr(self.decoder, "_last_trk_stm_apply_stats", None)
+                            if isinstance(st, dict):
+                                fr["trk_stm_apply"] = st
+                    except Exception:
+                        pass
                     # Online association stats from merger
                     if isinstance(getattr(online_merger, "last_stats", None), dict):
                         fr["assoc"] = online_merger.last_stats
@@ -4309,8 +4854,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             best_obj_ids_list = []
         for batch_idx, (data_sample, tmp_xyz) in enumerate(zip(batch_data_samples, all_xyz)):
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask[frame_i].clone() # [20000] 
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points)) # [20000] 
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks) # [20000]
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True) # [N_segment, 96], [20000, 1]
         features = []
@@ -4586,8 +5133,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             best_obj_ids_list = []
         for batch_idx, (data_sample, tmp_xyz) in enumerate(zip(batch_data_samples, all_xyz)):
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask[frame_i].clone()
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points)) 
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks) # [20000]
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True) # [N_segment, 96], [20000, 1]
         features = []
@@ -4687,23 +5236,38 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             return results
 
         _, inverse = np.unique(segment_ids, return_inverse=True)
-        seg_t = torch.as_tensor(inverse, device=device, dtype=torch.long)
 
-        sem_t = torch.as_tensor(sem_np, device=device, dtype=torch.long)
-        sem_seg = scatter_mean(F.one_hot(sem_t).float(), seg_t, dim=0)
-        sem_out = sem_seg.argmax(dim=1)[seg_t]
+        def _run(run_device):
+            seg_t = torch.as_tensor(inverse, device=run_device, dtype=torch.long)
 
-        if ins_np.shape[0] == 0:
+            sem_t = torch.as_tensor(sem_np, device=run_device, dtype=torch.long)
+            sem_seg = scatter_mean(F.one_hot(sem_t).float(), seg_t, dim=0)
+            sem_out = sem_seg.argmax(dim=1)[seg_t]
+
+            if ins_np.shape[0] == 0:
+                results.pts_semantic_mask[0] = sem_out.cpu().numpy()
+                return results
+
+            ins_t = torch.as_tensor(ins_np, device=run_device).float()
+            ins_seg = scatter_mean(ins_t, seg_t, dim=1)
+            ins_out = (ins_seg > 0.5)[:, seg_t]
+
             results.pts_semantic_mask[0] = sem_out.cpu().numpy()
+            results.pts_instance_mask[0] = ins_out.cpu().numpy()
             return results
 
-        ins_t = torch.as_tensor(ins_np, device=device).float()
-        ins_seg = scatter_mean(ins_t, seg_t, dim=1)
-        ins_out = (ins_seg > 0.5)[:, seg_t]
-
-        results.pts_semantic_mask[0] = sem_out.cpu().numpy()
-        results.pts_instance_mask[0] = ins_out.cpu().numpy()
-        return results
+        try:
+            return _run(device)
+        except RuntimeError as e:
+            # Some MV scenes can be very large; if CUDA OOM happens here,
+            # fall back to CPU to keep evaluation running.
+            if getattr(device, 'type', None) == 'cuda' and 'out of memory' in str(e).lower():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                return _run(torch.device('cpu'))
+            raise
     
     def predict_by_feat(self, out, superpoints):
         """Predict instance, semantic, and panoptic masks for a single scene.
@@ -5224,8 +5788,10 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         sp_pts_masks, n_super_points = [], []
         for data_sample in batch_data_samples:
             sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask[frame_i]
+            sp_pts_mask = sp_pts_mask.to(dtype=torch.long)
+            _, sp_pts_mask = torch.unique(sp_pts_mask, sorted=True, return_inverse=True)
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-            n_super_points.append(sp_pts_mask.max() + 1)
+            n_super_points.append(int(sp_pts_mask.max().item()) + 1 if sp_pts_mask.numel() else 0)
         sp_idx = torch.cat(sp_pts_masks)
         x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True)
 
@@ -5298,7 +5864,7 @@ class MultiScaleQuery(nn.Module):
         nn.init.zeros_(self.gen_tau.weight)
         nn.init.uniform_(self.gen_tau.bias, 0.0, 2.0)
 
-    def forward(self, pos1_xyz, query_feat, key_feat, val_feat, pos2_xyz=None):
+    def forward(self, pos1_xyz, query_feat, key_feat, val_feat, pos2_xyz=None, dist_scale: float = 1.0):
         """
         pos1_xyz: list of [num_queries_i, 3]
         query_feat: list of [num_queries_i, embed_dims]
@@ -5354,6 +5920,10 @@ class MultiScaleQuery(nn.Module):
         else:
             dist = self.calc_bbox_dists2(padded_pos1_xyz, pos1_mask_spatial, 
                                         padded_pos2_xyz, pos2_mask_spatial)  # [B, Q_max, K_max]
+        try:
+            dist = dist * float(dist_scale)
+        except Exception:
+            pass
         
         if torch.isnan(dist).any():
             raise ValueError("NaN detected in dist")

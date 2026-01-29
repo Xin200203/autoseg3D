@@ -690,6 +690,59 @@ AutoSeg3D 的 Online 类（`ScanNet200MixFormer3D_Online`）会引入 `memory/me
 4) **保持原 3D CA 主干不被覆盖**：DACA‑2D 作为 SP 域的增量注入模块  
    - 不应删/替换原有 3D cross‑attn/self‑attn；DACA‑2D 是“额外一条信息通路”，不是主干替代。
 
+### V3‑0.1 坐标系校准清单（V3 规范段落 / 验收标准，必须长期遵守）
+
+> 这部分是 V3 里**最容易“看起来启用但实际无效/甚至变差”**的根因：同一个样本在训练中同时存在多套 3D 坐标（raw / aug / elastic）。  
+> **正确做法不是“全程只用一个坐标系”，而是：每个模块必须使用它约定的坐标空间，并且三套空间之间要“索引一致、定义清晰、传参明确”。**
+
+#### 0) AutoSeg3D 真实存在的三套 3D 坐标（必须统一命名）
+
+- **(A) raw（投影空间）**：`points_raw[:, :3]`  
+  - 来源：pipeline 的 `SavePointsForProjection`（保存 3D aug 之前的点）。  
+  - 目的：与相机几何 `cam_info.pose/intrinsics` 严格一致，用于 `uv/valid/in_box` 这类 2D-3D 投影判定。
+- **(B) aug/wo-elastic（decoder 距离门控空间）**：`points[:, :3]`  
+  - 含义：经过 `RandomFlip3D + GlobalRotScaleTrans`（rigid 3D aug）之后的点，**不包含 elastic**（elastic 只写 `elastic_coords`，不改 `points`）。  
+  - 目的：用于 DACA‑2D 的 3D anchor（`query2d_pos`）写入，以及 DACA mask 的距离门控（与 decoder 内部 `sp_pos_list` 一致）。
+- **(C) elastic（3D 特征/box 空间）**：`elastic_coords * voxel_size`  
+  - 含义：elastic augmentation 后的点坐标（Minkowski sparse conv 的主特征空间）。  
+  - 目的：用于 3D box‑modulated CA‑3D（SegDINO3D Sec 3.3）与 box loss 的监督空间；也用于 `scene_range` 的归一化。
+
+#### 1) 各模块必须使用的坐标空间（写死的工程约束）
+
+1) **GDINO point‑fusion（image‑level）**  
+   - `uv/valid` 投影必须使用 **raw：`points_raw`**（相机几何只在 raw 空间成立）。  
+   - 抽样成功率监控：`valid_ratio` 应接近 1（建议 `>=0.95` strict）。
+
+2) **GDINO DACA‑2D 的 support points 选择（box 内点）**  
+   - `in_box` 判定必须使用 **raw 投影**得到的 `uv`（来自 `points_raw`）。  
+   - 这是“这个 2D box 覆盖到哪些 3D 点”的唯一正确依据。
+
+3) **GDINO DACA‑2D 的 3D anchor 写入（`query2d_pos`）**  
+   - `query2d_pos` 必须写在 **aug/wo-elastic：`points`** 空间：对 `in_box` 的点索引 `idx`，用 `points[idx].median/mean` 得到 `q_pos`。  
+   - 目的：保证 DACA‑2D 的距离门控在 decoder 的 3D 空间里可用（与 `sp_pos_list` 同空间）。
+
+4) **DACA‑2D 距离门控（mask）**  
+   - `dist = cdist(sp_pos_wo_elastic, query2d_pos, p=1)` 时，`sp_pos_wo_elastic` 必须来自 **aug/wo-elastic：`points`** 的 superpoint scatter mean；`query2d_pos` 同样来自 `points`。  
+   - 注意：这里的 “wo‑elastic” 指的是**不带 elastic**；不是 `points_raw`。  
+   - 违反该规则会出现一种非常隐蔽的现象：`valid_ratio` 仍很高，但 `allowed_zero`（3D queries 没有任何 2D query 可 attend）会显著升高，最终等价于注入 no-op。
+
+5) **3D box‑modulated CA‑3D（SegDINO3D Sec 3.3）与 box loss（L_box）**  
+   - **必须在 elastic 空间**：GT 的 `bboxes_3d / instance_centers / instance_sizes` 与 `scene_range` 都要用 `elastic_coords*voxel_size` 计算（若无 elastic，则退化到 `points[:,:3]`）。  
+   - 预测的 `pred_centers/pred_sizes` 同样在 elastic 空间解释。  
+   - 目的：避免 “loss 在 elastic、attention 在 points” 或反之导致监督失真。
+
+#### 2) 强制自检（只要不满足就应该直接报错/退出训练）
+
+每个 batch（SV，T=1）至少检查：
+- **索引一致性**：`points_raw.shape[0] == points.shape[0] == num_sample`；若有 `elastic_coords` 则 `elastic_coords.shape[0] == points.shape[0]`。  
+  - 不一致代表 `SavePointsForProjection` 放置错误或 pipeline 在保存 raw 后又重采样/裁剪了点（投影会整体错位）。
+- **投影只走 raw**：任何使用 `points`/`elastic_coords` 做相机投影都应视为 bug。  
+- **DACA 距离空间一致**：`query2d_pos` 与 `sp_pos_wo_elastic` 必须来自同一套 `points`（aug/wo-elastic）。  
+- **训练期监控**（建议长期打印/汇总）：  
+  - `point_fusion.valid_ratio_mean/min`  
+  - `daca2d.valid_ratio_mean/min` + `qpos_rate_mean/min` + `nq_keep_mean/nq_pos_mean`  
+  - `daca2d.apply.allowed_zero`（如果持续很高，说明门控空间或阈值有问题）
+
 ## V3‑1：Point‑level early fusion（严格对齐 SegDINO3D：256d 直接进 UNet）
 
 ### 目标（对齐事实）
