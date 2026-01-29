@@ -38,6 +38,11 @@ def gdino_cache_path(
     cache_dir = _norm_path(cache_dir)
     img_path_n = _norm_path(img_path)
     repo_dir, config_path, checkpoint, caption = _get_bb_fields(bb_cfg)
+    # Visual features (srcs) do not depend on caption/text.
+    # For `mode=backbone` we intentionally ignore `caption` so different prompt
+    # configs can reuse the same cached `srcs`.
+    if str(mode).lower() in ("backbone", "srcs"):
+        caption = ""
     h, w = int(target_hw[0]), int(target_hw[1])
 
     key = "|".join(

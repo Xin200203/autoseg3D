@@ -25,4 +25,7 @@ val_dataloader = dict(num_workers=0, persistent_workers=False, dataset=dict(data
 test_dataloader = val_dataloader
 
 train_cfg = dict(type="EpochBasedTrainLoop", max_epochs=1, val_interval=1)
-default_hooks = dict(logger=dict(interval=1))
+default_hooks = dict(
+    logger=dict(interval=1),
+    checkpoint=dict(type="CheckpointHook", interval=999, save_last=False, save_best=None),
+)
