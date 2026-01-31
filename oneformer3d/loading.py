@@ -324,7 +324,12 @@ class LoadAdjacentDataFromFile(BaseTransform):
         if self.rec_data_root:
             rec_root = os.path.abspath(os.path.expanduser(self.rec_data_root))
         else:
-            rec_root = os.path.join('data', self.dataset_type)
+            # Default to AutoSeg3D/data/<dataset_type> (stable regardless of CWD).
+            # `loading.py` lives in AutoSeg3D/oneformer3d/, so `../data` is the
+            # repo-local data folder.
+            rec_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "data", self.dataset_type)
+            )
         rec_pts_filename = os.path.join(rec_root, 'points', scene_name + '.bin')
         rec_ins_path = os.path.join(rec_root, 'instance_mask', scene_name + '.bin')
         rec_sem_path = os.path.join(rec_root, 'semantic_mask', scene_name + '.bin')

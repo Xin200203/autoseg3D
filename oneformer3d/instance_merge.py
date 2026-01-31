@@ -179,11 +179,19 @@ class GTMerge():
 
 
 class OnlineMerge():
-    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count"):
+    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", diag_cfg=None):
         assert merge_type in ['count', 'frame']
         self.merge_type = merge_type
         self.inscat_topk_insts = inscat_topk_insts
         self.use_bbox = use_bbox
+        self.last_stats = None
+        self.diag_cfg = diag_cfg if isinstance(diag_cfg, dict) else {}
+        self.diag_match_cos_cfg = self.diag_cfg.get("match_cos", {}) if isinstance(self.diag_cfg, dict) else {}
+        self.diag_match_cos_enable = bool(self.diag_match_cos_cfg.get("enable", False))
+        self.diag_match_cos_stride = int(self.diag_match_cos_cfg.get("frame_stride", 5))
+        self.diag_match_cos_neg_pairs = int(self.diag_match_cos_cfg.get("neg_pairs", 2048))
+        self.diag_match_cos_save_raw = bool(self.diag_match_cos_cfg.get("save_raw", False))
+        self.diag_match_cos_max_raw = int(self.diag_match_cos_cfg.get("max_raw", 512))
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         self.cur_masks = None
@@ -195,6 +203,22 @@ class OnlineMerge():
         self.cur_xyz = None
         self.fi = 0
         self.merge_counts = None
+
+    @staticmethod
+    def _qstats_1d(x: torch.Tensor) -> dict:
+        try:
+            if x is None or (not torch.is_tensor(x)) or x.numel() == 0:
+                return {"n": 0}
+            x = x.detach().float()
+            return {
+                "n": int(x.numel()),
+                "mean": float(x.mean().item()),
+                "p10": float(torch.quantile(x, 0.10).item()),
+                "p50": float(torch.quantile(x, 0.50).item()),
+                "p90": float(torch.quantile(x, 0.90).item()),
+            }
+        except Exception:
+            return {"n": 0}
     
     def clean(self):
         self.cur_masks = None
@@ -219,6 +243,16 @@ class OnlineMerge():
             self.cur_sem_preds = sem_preds
             self.cur_xyz = self._bbox_pred_to_bbox(xyz_list, bboxes) if self.use_bbox else xyz_list
             self.merge_counts = torch.zeros_like(scores).long()
+            # Monitoring snapshot for first frame.
+            try:
+                self.last_stats = {
+                    "det": int(masks.shape[0]),
+                    "matched": 0,
+                    "birth": int(masks.shape[0]),
+                    "use_bbox": bool(self.use_bbox),
+                }
+            except Exception:
+                self.last_stats = None
         else:
             self.fi += 1
             next_masks, next_labels, next_scores, next_queries, next_query_feats, next_sem_preds, next_xyz = \
@@ -247,6 +281,34 @@ class OnlineMerge():
             mix_scores_mask = mix_scores[row_ind, col_ind].gt(0)
             row_ind = row_ind[mix_scores_mask]
             col_ind = col_ind[mix_scores_mask]
+
+            # Optional: matched embedding cosine stability (GT-free).
+            match_cos = None
+            if (
+                bool(self.diag_match_cos_enable)
+                and (int(self.fi) % int(max(self.diag_match_cos_stride, 1)) == 0)
+                and row_ind.numel() > 0
+                and col_ind.numel() > 0
+            ):
+                try:
+                    q_prev = self.cur_query_feats[row_ind]
+                    q_cur = next_query_feats[col_ind]
+                    if q_prev.dim() == 2 and q_cur.dim() == 2 and q_prev.shape == q_cur.shape:
+                        match_cos = F.cosine_similarity(q_prev, q_cur, dim=-1)
+                except Exception:
+                    match_cos = None
+            neg_cos = None
+            if bool(self.diag_match_cos_enable) and int(self.diag_match_cos_neg_pairs) > 0 and int(self.cur_query_feats.shape[0]) >= 2:
+                try:
+                    n = int(self.cur_query_feats.shape[0])
+                    npairs = int(self.diag_match_cos_neg_pairs)
+                    idx1 = torch.randint(0, n, (npairs,), device=self.cur_query_feats.device)
+                    idx2 = torch.randint(0, n, (npairs,), device=self.cur_query_feats.device)
+                    keep = idx1 != idx2
+                    if int(keep.sum().item()) > 0:
+                        neg_cos = F.cosine_similarity(self.cur_query_feats[idx1[keep]], self.cur_query_feats[idx2[keep]], dim=-1)
+                except Exception:
+                    neg_cos = None
 
             temp = torch.zeros(self.cur_masks.shape[0]).bool().to(self.cur_masks.device) # [N_obj_previous]
             temp[row_ind] = True
@@ -286,6 +348,35 @@ class OnlineMerge():
             # self.cur_sem_preds = torch.cat((self.cur_sem_preds, next_sem_preds[no_merge_masks]), dim=0)
             self.cur_xyz[row_ind] = (self.cur_xyz[row_ind] * count + next_xyz[col_ind]) / (count + 1)
             self.cur_xyz = torch.cat((self.cur_xyz, next_xyz[no_merge_masks]), dim=0)
+
+            # Monitoring snapshot for this frame.
+            try:
+                birth_cnt = int(no_merge_masks.sum().item()) if torch.is_tensor(no_merge_masks) else int((~no_merge_masks).sum())
+                self.last_stats = {
+                    "det": int(next_masks.shape[0]),
+                    "matched": int(col_ind.numel()),
+                    "birth": int(birth_cnt),
+                    "use_bbox": bool(self.use_bbox),
+                }
+                if bool(self.diag_match_cos_enable):
+                    mc = {
+                        "frame": int(self.fi),
+                        "pos": self._qstats_1d(match_cos) if torch.is_tensor(match_cos) else {"n": 0},
+                        "neg": self._qstats_1d(neg_cos) if torch.is_tensor(neg_cos) else {"n": 0},
+                    }
+                    if bool(self.diag_match_cos_save_raw):
+                        try:
+                            if torch.is_tensor(match_cos) and match_cos.numel() > 0:
+                                k = int(min(int(match_cos.numel()), int(max(self.diag_match_cos_max_raw, 0))))
+                                mc["pos_raw"] = match_cos.detach().float().flatten()[:k].cpu().tolist()
+                            if torch.is_tensor(neg_cos) and neg_cos.numel() > 0:
+                                k = int(min(int(neg_cos.numel()), int(max(self.diag_match_cos_max_raw, 0))))
+                                mc["neg_raw"] = neg_cos.detach().float().flatten()[:k].cpu().tolist()
+                        except Exception:
+                            pass
+                    self.last_stats["match_cos"] = mc
+            except Exception:
+                self.last_stats = None
             
         if len(self.cur_scores) > self.inscat_topk_insts:
             _, kept_ins = self.cur_scores.topk(self.inscat_topk_insts)
@@ -364,6 +455,15 @@ class DQ_Track_OnlineMerge():
         self.diag_voxel_size = float(self.diag_cfg.get("voxel_size", 0.12))
         self.diag_det_vox_cap = int(self.diag_cfg.get("det_vox_cap", 512))
         self.diag_trk_vox_cap = int(self.diag_cfg.get("trk_vox_cap", 2048))
+        # Optional: track-aligned embedding stability stats (GT-free).
+        # Measures cosine between matched det embedding and the corresponding track embedding
+        # (pre-update, using Hungarian matches). Helps diagnose view-dependent drift.
+        self.diag_match_cos_cfg = self.diag_cfg.get("match_cos", {}) if isinstance(self.diag_cfg, dict) else {}
+        self.diag_match_cos_enable = bool(self.diag_match_cos_cfg.get("enable", False))
+        self.diag_match_cos_stride = int(self.diag_match_cos_cfg.get("frame_stride", 5))
+        self.diag_match_cos_neg_pairs = int(self.diag_match_cos_cfg.get("neg_pairs", 2048))
+        self.diag_match_cos_save_raw = bool(self.diag_match_cos_cfg.get("save_raw", False))
+        self.diag_match_cos_max_raw = int(self.diag_match_cos_cfg.get("max_raw", 512))
         self._track_gt_votes = {}  # gid -> {gt_id: count}
         self._track_voxels = {}  # gid -> 1D int64 voxel ids (cpu, unique)
         self._diag = None
@@ -374,6 +474,23 @@ class DQ_Track_OnlineMerge():
                 "track_track": {"pos": [], "neg": []},
                 "meta": {"frames_seen": 0, "pos_pairs": 0, "neg_pairs": 0},
             }
+
+    @staticmethod
+    def _qstats_1d(x: torch.Tensor) -> dict:
+        """Quantile stats for a 1D tensor on current device (no sync except reductions)."""
+        try:
+            if x is None or (not torch.is_tensor(x)) or x.numel() == 0:
+                return {"n": 0}
+            x = x.detach().float()
+            return {
+                "n": int(x.numel()),
+                "mean": float(x.mean().item()),
+                "p10": float(torch.quantile(x, 0.10).item()),
+                "p50": float(torch.quantile(x, 0.50).item()),
+                "p90": float(torch.quantile(x, 0.90).item()),
+            }
+        except Exception:
+            return {"n": 0}
 
     def export_bbox_center_diag(self):
         if not self.diag_enable or not isinstance(self._diag, dict):
@@ -648,6 +765,59 @@ class DQ_Track_OnlineMerge():
             col_ind = col_ind[mix_scores_mask]
             match_dets = col_ind
             match_tracks = valid_track_idx[row_ind]
+
+            # Track-aligned cosine stability (GT-free): matched det embedding vs track embedding (pre-update).
+            # Negative samples: random track-track pairs among currently valid tracks.
+            if (
+                bool(self.diag_match_cos_enable)
+                and frame_idx is not None
+                and (int(frame_idx) % int(max(self.diag_match_cos_stride, 1)) == 0)
+            ):
+                try:
+                    trk_q_all = getattr(track_instances, "queries", None)
+                    if isinstance(trk_q_all, (list, tuple)):
+                        trk_q_all = trk_q_all[batch_idx]
+                    if torch.is_tensor(trk_q_all) and trk_q_all.numel() > 0:
+                        # Positive: matched pairs (pre-update track embedding).
+                        pos_cos = None
+                        if match_tracks.numel() > 0 and match_dets.numel() > 0:
+                            trk_q_match = trk_q_all[match_tracks]  # [K, D]
+                            det_q_match = next_query_feats[match_dets]  # [K, D]
+                            if trk_q_match.dim() == 2 and det_q_match.dim() == 2 and trk_q_match.shape == det_q_match.shape:
+                                pos_cos = F.cosine_similarity(trk_q_match, det_q_match, dim=-1)
+
+                        # Negative: random pairs among valid track embeddings.
+                        neg_cos = None
+                        neg_pairs = int(max(self.diag_match_cos_neg_pairs, 0))
+                        if neg_pairs > 0 and int(valid_track_idx.numel()) >= 2:
+                            trk_q_valid = trk_q_all[valid_track_idx]  # [T, D]
+                            n = int(trk_q_valid.shape[0])
+                            idx1 = torch.randint(0, n, (neg_pairs,), device=trk_q_valid.device)
+                            idx2 = torch.randint(0, n, (neg_pairs,), device=trk_q_valid.device)
+                            keep = idx1 != idx2
+                            if int(keep.sum().item()) > 0:
+                                neg_cos = F.cosine_similarity(
+                                    trk_q_valid[idx1[keep]], trk_q_valid[idx2[keep]], dim=-1
+                                )
+
+                        cos_diag = {
+                            "frame": int(frame_idx),
+                            "pos": self._qstats_1d(pos_cos) if torch.is_tensor(pos_cos) else {"n": 0},
+                            "neg": self._qstats_1d(neg_cos) if torch.is_tensor(neg_cos) else {"n": 0},
+                        }
+                        if bool(self.diag_match_cos_save_raw):
+                            try:
+                                k = int(max(self.diag_match_cos_max_raw, 0))
+                                if torch.is_tensor(pos_cos) and pos_cos.numel() > 0 and k > 0:
+                                    cos_diag["pos_raw"] = pos_cos.detach().float().flatten()[:k].cpu().tolist()
+                                if torch.is_tensor(neg_cos) and neg_cos.numel() > 0 and k > 0:
+                                    cos_diag["neg_raw"] = neg_cos.detach().float().flatten()[:k].cpu().tolist()
+                            except Exception:
+                                pass
+                        # Defer attaching to last_stats (it will be overwritten later in this merge()).
+                        self._last_match_cos_diag = cos_diag
+                except Exception:
+                    pass
 
             # Optional: update track->GT votes (method A) using current Hungarian matches.
             if self.diag_enable and gt_inst is not None and torch.is_tensor(gt_inst):
@@ -1155,6 +1325,18 @@ class DQ_Track_OnlineMerge():
                     "track_valid_after": int(track_instances.valid_track[batch_idx].sum().item()),
                     "use_bbox": bool(self.use_bbox),
                 }
+                # Attach deferred match-cos stats (if computed this frame).
+                try:
+                    mc = getattr(self, "_last_match_cos_diag", None)
+                    if isinstance(mc, dict):
+                        self.last_stats["match_cos"] = mc
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "_last_match_cos_diag"):
+                        delattr(self, "_last_match_cos_diag")
+                except Exception:
+                    pass
             except Exception:
                 self.last_stats = None
         if len(self.cur_scores) > self.inscat_topk_insts:

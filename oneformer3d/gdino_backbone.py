@@ -40,6 +40,7 @@ class GroundingDINOBackbone(BaseModule):
         caption: str = "object.",
         max_text_len: Optional[int] = None,
         unset_image_tensor: bool = True,
+        cache_only: bool = False,
     ) -> None:
         super().__init__()
         self.repo_dir = repo_dir
@@ -49,6 +50,23 @@ class GroundingDINOBackbone(BaseModule):
         self.caption = caption if caption.endswith(".") else (caption + ".")
         self.max_text_len = max_text_len
         self.unset_image_tensor = bool(unset_image_tensor)
+        # Global switch: when training from precomputed GDINO cache, avoid
+        # initializing the full model (which may trigger HF downloads via
+        # transformers). Set `GDINO_CACHE_ONLY=0` to keep online fallback.
+        env_cache_dir = os.environ.get("GDINO_CACHE_DIR", "")
+        env_cache_only = os.environ.get("GDINO_CACHE_ONLY", "")
+        if (not cache_only) and env_cache_dir and str(env_cache_only) != "0":
+            cache_only = True
+        self.cache_only = bool(cache_only)
+
+        # When training fully from an offline GDINO cache, we do not need to
+        # build the full GroundingDINO model (which may trigger HF downloads via
+        # transformers). In this mode, forward should never be called; if it is,
+        # we raise a clear error.
+        if self.cache_only:
+            self.model = None
+            self._gen_masks = None
+            return
 
         _ensure_repo_on_path(self.repo_dir)
         from groundingdino.models import build_model  # type: ignore
@@ -94,6 +112,13 @@ class GroundingDINOBackbone(BaseModule):
         captions: Optional[List[str]] = None,
         backbone_only: bool = False,
     ) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError(
+                "GroundingDINOBackbone was initialized with cache_only=True, so "
+                "online GDINO forward is disabled. Ensure GDINO cache is fully "
+                "precomputed and set GDINO_CACHE_DIR, or set cache_only=False "
+                "to allow online fallback."
+            )
         """Run GroundingDINO forward and return intermediate features.
 
         Args:

@@ -3,12 +3,20 @@ _base_ = [
     'mmdet3d::_base_/datasets/scannet-seg.py'
 ]
 custom_imports = dict(imports=['oneformer3d'])
+import os.path as osp
+import os
 
-num_instance_classes = 1
+num_instance_classes = 198
 num_semantic_classes = 200
-num_instance_classes_eval = 1
+num_instance_classes_eval = 198
 use_bbox = True
 voxel_size = 0.02
+
+# GDINO (GroundingDINO) settings for online 2D-3D fusion (A3-style).
+gdino_ckpt = '/home/nebula/xxy/dataset/models/groundingdino_swinb_cogcoor.pth'
+gdino_repo = '/home/nebula/xxy/GroundingDINO'
+gdino_cfg = '/home/nebula/xxy/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py'
+gdino_img_hw = (420, 560)  # (H,W)
 
 # Added
 debug_mode = False
@@ -71,6 +79,32 @@ more_keys_list = ['sp_gt_inst_ids', 'sp_gt_semantic_ids']
 
 model = dict(
     type='ScanNet200MixFormer3D_Online',
+    gdino_backbone=dict(
+        type='GroundingDINOBackbone',
+        repo_dir=gdino_repo,
+        config_path=gdino_cfg,
+        checkpoint=gdino_ckpt,
+        device='cuda',
+        caption='object.',
+        # When GDINO cache is provided, disable online initialization to avoid
+        # HuggingFace downloads (Stage2 should fully rely on cached outputs).
+        cache_only=(os.environ.get('GDINO_CACHE_DIR', '') != ''),
+    ),
+    gdino_point_fusion=dict(
+        enable=True,
+        in_dim=256,
+        out_dim=256,
+        proj_type='identity',
+        mode='fpn',
+        fuse_mode='fpn',
+        feat_levels=[0, 1, 2, 3],
+        backbone_only=True,
+        max_depth=10.0,
+        align_corners=False,
+        strict=True,
+        strict_valid_ratio=0.95,
+        log_fail=True,
+    ),
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=voxel_size,
 
@@ -97,10 +131,15 @@ model = dict(
         type='Res16UNet34C',
         in_channels=3,
         out_channels=96,
+        dino_dim=256,
         config=dict(
             dilations=[1, 1, 1, 1],
             conv1_kernel_size=5,
-            bn_momentum=0.02)),
+            bn_momentum=0.02,
+            dino_strict=True,
+            dino_min_hit_ratio=0.95,
+            dino_residual=True,
+        )),
     memory=dict(type='MultilevelMemory', in_channels=[32, 64, 128, 256], queue=-1, vmp_layer=(0,1,2,3)),
     pool=dict(type='GeoAwarePooling', channel_proj=96),
     decoder=dict(
@@ -164,7 +203,19 @@ model = dict(
             fix_dice_loss_weight=True,
             iter_matcher=True,
             fix_mean_loss=True)),
-    train_cfg=dict(),
+    train_cfg=dict(
+        gdino_daca2d=dict(
+            enable=True,
+            mode='fuse',
+            score_thr=0.10,
+            max_queries=50,
+            max_depth=10.0,
+            log_valid_every=50,
+            strict=True,
+            log_fail=True,
+            mask=dict(metric='l1', thr=0.3, domain='sp', order='paper'),
+        ),
+    ),
     test_cfg=dict(
         # TODO: a larger topK may be better
         topk_insts=100,
@@ -177,10 +228,64 @@ model = dict(
         nms=True,
         matrix_nms_kernel='linear',
         stuff_classes=[0, 1],
+        gdino_daca2d=dict(
+            enable=True,
+            mode='fuse',
+            score_thr=0.10,
+            max_queries=50,
+            max_depth=10.0,
+            log_valid_every=50,
+            strict=True,
+            log_fail=True,
+            mask=dict(metric='l1', thr=0.3, domain='sp', order='paper'),
+        ),
         merge_type='learnable_online'))
 
 dataset_type = 'ScanNet200SegMVDataset_'
-data_root = 'data/scannet200-mv_fast/'
+# -----------------------------------------------------------------------------
+# Data roots (split MV vs REC to avoid path confusion)
+#
+# - MV root: multi-view frame-level data (points/sceneXXXX_XX/<frame>.bin, 2D/, ...)
+# - REC root: reconstructed single-scan data used by `with_rec`
+#   (points/sceneXXXX_XX.bin, instance_mask/, semantic_mask/, scans/)
+#
+# `LoadAdjacentDataFromFile._load_rec_3d()` defaults to `data/<dataset_type>` when
+# `rec_data_root` is not provided, which is fragile when running from a different
+# CWD. We set explicit absolute roots under AutoSeg3D/data.
+# -----------------------------------------------------------------------------
+def _guess_autoseg3d_root() -> str:
+    # `mmengine.Config.fromfile()` may exec configs without defining `__file__`.
+    cfg_file = globals().get('__file__', None)
+    if isinstance(cfg_file, str) and cfg_file:
+        return osp.abspath(osp.join(osp.dirname(cfg_file), '..', '..'))
+
+    # Common CWD layouts.
+    for cand in (
+        osp.join(os.getcwd(), 'AutoSeg3D'),
+        '/home/nebula/xxy/AutoSeg3D',
+    ):
+        if osp.isdir(cand):
+            return osp.abspath(cand)
+
+    # Search upward from CWD.
+    d = os.getcwd()
+    while True:
+        cand = osp.join(d, 'AutoSeg3D')
+        if osp.isdir(cand):
+            return osp.abspath(cand)
+        parent = osp.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    raise RuntimeError(
+        'Cannot locate AutoSeg3D repo root. Please set DATA_ROOT_MV/DATA_ROOT_REC explicitly.'
+    )
+
+
+_AUTOSEG3D_ROOT = _guess_autoseg3d_root()
+DATA_ROOT_MV = osp.join(_AUTOSEG3D_ROOT, 'data', 'scannet200-mv_fast')
+DATA_ROOT_REC = osp.join(_AUTOSEG3D_ROOT, 'data', 'scannet200')
+data_root = DATA_ROOT_MV
 
 # floor and chair are changed
 class_names = [
@@ -250,7 +355,17 @@ train_pipeline = [
         with_seg_3d=True,
         with_sp_mask_3d=True,
         with_rec=use_bbox, cat_rec=use_bbox,
+        # Keep (img_paths, poses) for online 2D backbones/diagnostics.
+        keep_img_paths_poses=True,
+        # Reconstructed single-scan data root for `with_rec`.
+        rec_data_root=DATA_ROOT_REC,
         dataset_type='scannet200'),
+    # Prepare raw points + camera info for GDINO point_fusion / DACA2D.
+    # Must happen before any 3D augmentations so projection stays consistent.
+    dict(type='SavePointsForProjection'),
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
+    dict(type='ResizeForGDINO', target_size=gdino_img_hw),
+    dict(type='NormalizeCamInfo', strict=True),
     dict(type='SwapChairAndFloorWithRec' if use_bbox else 'SwapChairAndFloor'),
     dict(type='PointSegClassMappingWithRec' if use_bbox else 'PointSegClassMapping'),
     dict(
@@ -288,8 +403,11 @@ train_pipeline = [
     dict(
         type='Pack3DDetInputs_Online',
         keys=[
-            'points', 'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
-            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords'
+            # points_raw is needed for "raw projection + aug write-in" 2D-3D alignment.
+            'points', 'points_raw', 'gt_labels_3d', 'pts_semantic_mask',
+            'pts_instance_mask', 'sp_pts_mask', 'gt_sp_masks', 'elastic_coords',
+            # Online GDINO (DACA2D / point_fusion) needs these inputs.
+            'img_paths', 'poses', 'cam_info',
         ] + ['gt_bboxes_3d'] if use_bbox else [], 
         added_keys=more_keys_list)
 ]
@@ -313,11 +431,14 @@ test_pipeline = [
         # Keep (img_paths, poses) for online 2D backbones/diagnostics.
         keep_img_paths_poses=True,
         use_FF=False,
+        # Reconstructed single-scan data root for `with_rec`.
+        rec_data_root=DATA_ROOT_REC,
         dataset_type='scannet200'),
+    dict(type='SavePointsForProjection'),
     # Build per-frame cam_info (intrinsics/pose) for alignment-safe projection.
     dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
     # Fixed-size resize metadata for GroundingDINO (actual image resize is done online in model).
-    dict(type='ResizeForGDINO', target_size=(420, 560)),
+    dict(type='ResizeForGDINO', target_size=gdino_img_hw),
     # Normalize cam_info to stable per-frame list[dict] with tensor fields.
     dict(type='NormalizeCamInfo', strict=True),
     dict(type='SwapChairAndFloorWithRec'),
@@ -343,8 +464,10 @@ test_pipeline = [
     dict(
         type='Pack3DDetInputs_Online',
         keys=[
-            'points', 'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
-            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords'
+            'points', 'points_raw', 'gt_labels_3d', 'pts_semantic_mask',
+            'pts_instance_mask', 'sp_pts_mask', 'gt_sp_masks', 'elastic_coords',
+            # Online GDINO (DACA2D / point_fusion) needs these inputs.
+            'img_paths', 'poses', 'cam_info',
         ] + ['gt_bboxes_3d'] , 
         added_keys=more_keys_list)
 ]
@@ -423,7 +546,7 @@ param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
 
 # choose a best stage1
-load_from = 'work_dirs/AutoSeg3D_scannet200_stage1/epoch_128.pth'
+load_from = '/home/nebula/xxy/AutoSeg3D/work_dirs/ablation_stage1/A3_cat_stage1_fpn2dca_fromSV/best_all_ap_50%_epoch_128.pth'
 
 # training schedule for 1x
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=36, val_interval=4)
@@ -433,6 +556,13 @@ default_hooks = dict(
     timer=dict(type='IterTimerHook'),
     logger=dict(type='LoggerHook', interval=50),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', interval=4, max_keep_ckpts=50),
+    # Save only: latest + best AP50 (align with SV/stage1 configs)
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=1,
+        max_keep_ckpts=1,
+        save_last=True,
+        save_best='all_ap_50%',
+        rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='Det3DVisualizationHook'))

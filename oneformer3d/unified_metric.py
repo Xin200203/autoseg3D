@@ -245,6 +245,20 @@ class UnifiedSegMetric(SegMetric):
         daca_delta = _collect("daca2d_apply.delta_rel_mean")
         daca_q2d_any_sp = _collect("daca2d_apply.q2d_any_sp_rate")
 
+        # GT-aligned embedding stability diagnostics (oracle association by GT IoU).
+        gt_emb_pos_p10 = _collect("gt_emb_diag.pos_cos_p10")
+        gt_emb_pos_p50 = _collect("gt_emb_diag.pos_cos_p50")
+        gt_emb_pos_p90 = _collect("gt_emb_diag.pos_cos_p90")
+        gt_emb_pos_mean = _collect("gt_emb_diag.pos_cos_mean")
+        gt_emb_pos_n = _collect("gt_emb_diag.pos_cos_n")
+        gt_emb_pos_str_p50 = _collect("gt_emb_diag.pos_strong_cos_p50")
+        gt_emb_neg_p50 = _collect("gt_emb_diag.neg_cos_p50")
+        gt_emb_neg_p90 = _collect("gt_emb_diag.neg_cos_p90")
+        gt_emb_sep = _collect("gt_emb_diag.sep_pos50_neg90")
+        gt_emb_n_gt_mat = _collect("gt_emb_diag.n_gt_matched")
+        gt_emb_best_iou_p50 = _collect("gt_emb_diag.gt_best_iou_p50")
+        gt_emb_best_iou_ge = _collect("gt_emb_diag.gt_best_iou_ge_thr_rate")
+
         # Track-window STM apply stats (decoder-side; aggregated across decoder layers).
         trk_gate = _collect("trk_stm_apply.agg.gate_alpha")
         trk_mem_total = _collect("trk_stm_apply.agg.mem_tracks_total_mean")
@@ -304,6 +318,20 @@ class UnifiedSegMetric(SegMetric):
                 "nq3d": _pack(daca_nq3d),
                 "delta_rel_mean": _pack(daca_delta),
                 "q2d_any_sp_rate": _pack(daca_q2d_any_sp),
+            },
+            "gt_emb_diag": {
+                "pos_cos_p10": _pack(gt_emb_pos_p10),
+                "pos_cos_p50": _pack(gt_emb_pos_p50),
+                "pos_cos_p90": _pack(gt_emb_pos_p90),
+                "pos_cos_mean": _pack(gt_emb_pos_mean),
+                "pos_cos_n": _pack(gt_emb_pos_n),
+                "pos_strong_cos_p50": _pack(gt_emb_pos_str_p50),
+                "neg_cos_p50": _pack(gt_emb_neg_p50),
+                "neg_cos_p90": _pack(gt_emb_neg_p90),
+                "sep_pos50_neg90": _pack(gt_emb_sep),
+                "n_gt_matched": _pack(gt_emb_n_gt_mat),
+                "gt_best_iou_p50": _pack(gt_emb_best_iou_p50),
+                "gt_best_iou_ge_thr_rate": _pack(gt_emb_best_iou_ge),
             },
             "trk_stm_apply": {
                 "gate_alpha": _pack(trk_gate),

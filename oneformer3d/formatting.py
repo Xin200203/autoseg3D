@@ -144,7 +144,13 @@ class Pack3DDetInputs_(Pack3DDetInputs):
             if k in results:
                 img_metas[k] = results[k]
         data_sample.img_metas = img_metas
-        # data_sample.set_metainfo(img_metas)
+        # NOTE: Downstream online 2D-3D alignment modules may read from
+        # `data_sample.metainfo()` (mmengine BaseDataElement), while some
+        # legacy code reads `data_sample.img_metas`. Keep both in sync.
+        try:
+            data_sample.set_metainfo(img_metas)
+        except Exception:
+            pass
 
         inputs = {}
         for key in self.keys:
@@ -361,7 +367,12 @@ class Pack3DDetInputs_Online(Pack3DDetInputs):
             except Exception:
                 img_metas['lidar_idx'] = ''
         data_sample.img_metas = img_metas
-        # data_sample.set_metainfo(img_metas)
+        # NOTE: Keep both `img_metas` and `metainfo()` consistent for online
+        # GDINO projection/DACA2D which may read either field.
+        try:
+            data_sample.set_metainfo(img_metas)
+        except Exception:
+            pass
 
         inputs = {}
         for key in self.keys:

@@ -171,7 +171,25 @@ model = dict(
         nms=True,
         matrix_nms_kernel='linear',
         stuff_classes=[0, 1],
-        merge_type='learnable_online'))
+        merge_type='learnable_online',
+        # Monitoring only (no effect unless enable=True in cfg-options).
+        online_monitor=dict(
+            enable=False,
+            gt_vis_npoint=100,
+            iou_thr=0.5,
+            iou_lo_thr=0.1,
+            gt_frame_stride=5,
+            gt_emb_diag=dict(
+                enable=False,
+                frame_stride=1,
+                gt_vis_npoint=100,
+                iou_thr=0.5,
+                iou_lo_thr=0.1,
+                min_iou=0.1,
+                neg_pairs=2048,
+            ),
+        ),
+    ))
 
 dataset_type = 'ScanNet200SegMVDataset_'
 data_root = 'data/scannet200-mv_fast/'

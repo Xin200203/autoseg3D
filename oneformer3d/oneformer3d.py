@@ -31,22 +31,35 @@ class ScanNetOneFormer3DMixin:
             List[PointData]: of len 1 with `pts_semantic_mask`,
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
+        export_instance_queries = bool(
+            self.test_cfg.get('export_instance_queries', False)
+            or self.test_cfg.get('gt_emb_diag', {}).get('enable', False))
         inst_res = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.inst_score_thr)
+            out,
+            superpoints,
+            self.test_cfg.inst_score_thr,
+            return_queries=export_instance_queries)
         sem_res = self.predict_by_feat_semantic(out, superpoints)
         # pan_res = self.predict_by_feat_panoptic(out, superpoints)
 
         pts_semantic_mask = [sem_res.cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy()]
       
-        return [
-            PointData(
-                pts_semantic_mask=pts_semantic_mask,
-                pts_instance_mask=pts_instance_mask,
-                instance_labels=inst_res[1].cpu().numpy(),
-                instance_scores=inst_res[2].cpu().numpy())]
+        pred = PointData(
+            pts_semantic_mask=pts_semantic_mask,
+            pts_instance_mask=pts_instance_mask,
+            instance_labels=inst_res[1].cpu().numpy(),
+            instance_scores=inst_res[2].cpu().numpy())
+        if export_instance_queries:
+            pred.instance_queries = inst_res[3].detach().cpu()
+        return [pred]
     
-    def predict_by_feat_instance(self, out, superpoints, score_threshold):
+    def predict_by_feat_instance(
+            self,
+            out,
+            superpoints,
+            score_threshold,
+            return_queries: bool = False):
         """Predict instance masks for a single scene.
 
         Args:
@@ -62,9 +75,13 @@ class ScanNetOneFormer3DMixin:
                 Tensor: mask_preds of shape (n_preds, n_raw_points),
                 Tensor: labels of shape (n_preds,),
                 Tensor: scors of shape (n_preds,).
+                Tensor: instance queries of shape (n_preds, d), if
+                    `return_queries=True`.
         """
         cls_preds = out['cls_preds'][0]
         pred_masks = out['masks'][0]
+        queries = out.get('queries', None)
+        queries = None if queries is None else queries[0]
         assert self.num_classes == 1 or self.num_classes == cls_preds.shape[1] - 1
 
         scores = F.softmax(cls_preds, dim=-1)[:, :-1]
@@ -83,6 +100,11 @@ class ScanNetOneFormer3DMixin:
         topk_idx = torch.div(topk_idx, self.num_classes, rounding_mode='floor')
         mask_pred = pred_masks
         mask_pred = mask_pred[topk_idx]
+        if return_queries:
+            if queries is None:
+                raise RuntimeError(
+                    '[predict_by_feat_instance] return_queries=True but out[\"queries\"] is missing.')
+            query_pred = queries[topk_idx]
         mask_pred_sigmoid = mask_pred.sigmoid()
 
         if self.test_cfg.get('obj_normalization', None):
@@ -92,8 +114,10 @@ class ScanNetOneFormer3DMixin:
 
         if self.test_cfg.get('nms', None):
             kernel = self.test_cfg.matrix_nms_kernel
-            scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(
+            scores, labels, mask_pred_sigmoid, keep_inds = mask_matrix_nms(
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
+            if return_queries:
+                query_pred = query_pred[keep_inds]
 
         mask_pred_sigmoid = mask_pred_sigmoid[:, superpoints]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
@@ -103,6 +127,8 @@ class ScanNetOneFormer3DMixin:
         scores = scores[score_mask]
         labels = labels[score_mask]
         mask_pred = mask_pred[score_mask]
+        if return_queries:
+            query_pred = query_pred[score_mask]
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
@@ -110,7 +136,11 @@ class ScanNetOneFormer3DMixin:
         scores = scores[npoint_mask]
         labels = labels[npoint_mask]
         mask_pred = mask_pred[npoint_mask]
+        if return_queries:
+            query_pred = query_pred[npoint_mask]
 
+        if return_queries:
+            return mask_pred, labels, scores, query_pred
         return mask_pred, labels, scores
 
     def predict_by_feat_semantic(self, out, superpoints, classes=None):

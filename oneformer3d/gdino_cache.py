@@ -7,8 +7,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 
-def _norm_path(p: str) -> str:
+def _abspath(p: str) -> str:
     return os.path.abspath(os.path.expanduser(p))
+
+
+def _norm_path(p: str, *, resolve_symlinks: bool = True) -> str:
+    """Normalize a path for cache keying.
+
+    We resolve symlinks by default so the same underlying image can share a
+    cache entry even if accessed via different dataset roots/symlink chains
+    (e.g. `.../AutoSeg3D/data/.../2D/...` -> `/home/nebula/xxy/dataset/2D/...`).
+    """
+    p = _abspath(p)
+    return os.path.realpath(p) if resolve_symlinks else p
 
 
 def _get_bb_fields(bb_cfg: Optional[dict]) -> Tuple[str, str, str, str]:
@@ -28,6 +39,7 @@ def gdino_cache_path(
     target_hw: Tuple[int, int],
     bb_cfg: Optional[dict],
     mode: str = "full",
+    resolve_symlinks: bool = True,
 ) -> str:
     """Compute a deterministic cache file path.
 
@@ -35,8 +47,8 @@ def gdino_cache_path(
     "backbone" (srcs only). We include `mode` in the key to avoid accidental
     partial-data reads.
     """
-    cache_dir = _norm_path(cache_dir)
-    img_path_n = _norm_path(img_path)
+    cache_dir = _norm_path(cache_dir, resolve_symlinks=resolve_symlinks)
+    img_path_n = _norm_path(img_path, resolve_symlinks=resolve_symlinks)
     repo_dir, config_path, checkpoint, caption = _get_bb_fields(bb_cfg)
     # Visual features (srcs) do not depend on caption/text.
     # For `mode=backbone` we intentionally ignore `caption` so different prompt
@@ -89,7 +101,7 @@ def save_gdino_cache(
     payload: Dict[str, Any] = {
         "version": 1,
         "mode": str(mode),
-        "img_path": _norm_path(img_path),
+        "img_path": _norm_path(img_path, resolve_symlinks=True),
         "target_hw": (int(target_hw[0]), int(target_hw[1])),
         "bb": {
             "repo_dir": repo_dir,
@@ -129,10 +141,32 @@ def _load_one(
     bb_cfg: Optional[dict],
     mode: str,
 ) -> Optional[Dict[str, Any]]:
-    p = gdino_cache_path(
-        cache_dir, img_path=img_path, target_hw=target_hw, bb_cfg=bb_cfg, mode=mode
-    )
-    if not os.path.exists(p):
+    # Prefer symlink-resolved key (default) but fall back to legacy (abspath-only)
+    # to remain compatible with caches created before we normalized real paths.
+    cand = [
+        gdino_cache_path(
+            cache_dir,
+            img_path=img_path,
+            target_hw=target_hw,
+            bb_cfg=bb_cfg,
+            mode=mode,
+            resolve_symlinks=True,
+        ),
+        gdino_cache_path(
+            cache_dir,
+            img_path=img_path,
+            target_hw=target_hw,
+            bb_cfg=bb_cfg,
+            mode=mode,
+            resolve_symlinks=False,
+        ),
+    ]
+    p = None
+    for cp in cand:
+        if os.path.exists(cp):
+            p = cp
+            break
+    if p is None:
         return None
     try:
         obj = torch.load(p, map_location="cpu")

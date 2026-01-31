@@ -24,6 +24,40 @@ import re
 from typing import Any, Dict, List, Optional, Sequence
 
 
+def _is_numpy_obj(x: Any) -> bool:
+    mod = getattr(getattr(x, "__class__", None), "__module__", "")
+    return isinstance(mod, str) and mod.startswith("numpy")
+
+
+def _sanitize(obj: Any) -> Any:
+    """Convert numpy-containing structures into pure-Python types.
+
+    This makes the output pickle robust across numpy major versions (e.g.
+    numpy>=2 pickles may not unpickle under numpy<2 due to internal module
+    paths like `numpy._core`).
+    """
+    if _is_numpy_obj(obj):
+        if hasattr(obj, "item"):
+            try:
+                return obj.item()
+            except Exception:
+                pass
+        if hasattr(obj, "tolist"):
+            try:
+                return obj.tolist()
+            except Exception:
+                pass
+        return str(obj)
+
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_sanitize(v) for v in obj)
+    return obj
+
+
 def _extract_rel_img_paths(item: Dict[str, Any]) -> List[str]:
     if "img_path" in item and isinstance(item["img_path"], str):
         return [item["img_path"]]
@@ -127,7 +161,7 @@ def main() -> int:
     out = dict(base)
     out["data_list"] = kept
     out["subset_meta"] = subset_meta
-    _save_pkl(out_path, out)
+    _save_pkl(out_path, _sanitize(out))
 
     # Sidecar JSON for quick inspection
     try:
